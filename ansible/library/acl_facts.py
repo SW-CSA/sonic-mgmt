@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/python
 # This ansible module is for gathering ACL related facts from SONiC device.
 #
 # The "sonic-cfggen" tool is used to output all the running config data from db in JSON format. ACL table information
@@ -115,7 +115,9 @@
 #     }
 # }
 
-from ansible.module_utils.basic import *
+from ansible.module_utils.basic import AnsibleModule
+from collections import defaultdict
+from sonic_py_common import multi_asic
 
 
 DOCUMENTATION = '''
@@ -138,53 +140,75 @@ EXAMPLES = '''
 '''
 
 
-def get_all_config(module):
+def get_all_config(module, namespace=None):
     """
     @summary:  all running configuration using CLI tool sonic-cfggen.
     @param module: The AnsibleModule object
     @return: Return parsed config in dict
     """
-    rc, stdout, stderr = module.run_command('sonic-cfggen -d --print-data')
-    if rc != 0:
-        module.fail_json(msg='Failed to get DUT running config, rc=%s, stdout=%s, stderr=%s' % (rc, stdout, stderr))
-
+    if namespace:
+        rc, stdout, stderr = module.run_command('sonic-cfggen -n {} -d --print-data'.format(namespace))
+        if rc != 0:
+            module.fail_json(msg='Failed to get DUT running config, rc=%s, stdout=%s, stderr=%s' % (rc, stdout, stderr))
+    else:
+        rc, stdout, stderr = module.run_command('sonic-cfggen -d --print-data')
+        if rc != 0:
+            module.fail_json(msg='Failed to get DUT running config, rc=%s, stdout=%s, stderr=%s' % (rc, stdout, stderr))
     try:
         return module.from_json(stdout)
     except Exception as e:
-        module.fail_json(msg='Failed to parse config from output of "sonic-cfggen -d --print-data", err=' + str(e))
+        module.fail_json(
+            msg='Failed to parse config from output of "sonic-cfggen -d --print-data", err=' + str(e))
 
     return None
 
 
-def get_acl_rule_counters(module):
+def get_acl_rule_counters(module, namespace=None):
     """
     @summary: Parse the output of CLI 'aclshow -a' to get counters value of all ACL rules.
     @param module: The AnsibleModule object
     @return: Return ACL rule counters data in dict
     """
-    rc, stdout, stderr = module.run_command('aclshow -a')
-    if rc != 0:
-        module.fail_json(msg='Failed to get acl counter data, rc=%s, stdout=%s, stderr=%s' % (rc, stdout, stderr))
-
+    counter_aggrgeate_map = defaultdict(list)
     counters = []
-    output_lines = stdout.splitlines()[2:]  # Skip the header lines in output
-    for line in output_lines:
-        line_expanded = line.split()
-        if len(line_expanded) == 5:
-            try:
-                packets_count = int(line_expanded[3])
-            except ValueError:
-                packets_count = 0
-            try:
-                bytes_count = int(line_expanded[4])
-            except ValueError:
-                bytes_count = 0
-            counter = dict(rule_name=line_expanded[0],
-                           table_name=line_expanded[1],
-                           priority=line_expanded[2],
-                           packets_count=packets_count,
-                           bytes_count=bytes_count)
-            counters.append(counter)
+
+    namespace_list = multi_asic.get_namespace_list()
+    for ns in namespace_list:
+        if (namespace and namespace == ns) or namespace is None:
+            cmd = 'sudo ip netns exec {} '.format(ns) if ns else ''
+            rc, stdout, stderr = module.run_command(cmd + 'aclshow -a')
+            if rc != 0:
+                module.fail_json(msg='Failed to get acl counter data, rc=%s, stdout=%s, stderr=%s' % (rc,
+                                 stdout, stderr))
+
+            output_lines = stdout.splitlines()[2:]  # Skip the header lines in output
+            for line in output_lines:
+                line_expanded = line.split()
+                if len(line_expanded) == 5:
+                    try:
+                        packets_count = int(line_expanded[3])
+                    except ValueError:
+                        packets_count = 0
+                    try:
+                        bytes_count = int(line_expanded[4])
+                    except ValueError:
+                        bytes_count = 0
+
+                    key = (line_expanded[0], line_expanded[1], line_expanded[2])
+                    if key in counter_aggrgeate_map:
+                        counter_aggrgeate_map[key][0] = packets_count + counter_aggrgeate_map[key][0]
+                        counter_aggrgeate_map[key][1] = bytes_count + counter_aggrgeate_map[key][1]
+                    else:
+                        counter_aggrgeate_map[key].append(packets_count)
+                        counter_aggrgeate_map[key].append(bytes_count)
+
+    for k, v in counter_aggrgeate_map.items():
+        counter = dict(rule_name=k[0],
+                       table_name=k[1],
+                       priority=k[2],
+                       packets_count=v[0],
+                       bytes_count=v[1])
+        counters.append(counter)
 
     return counters
 
@@ -204,7 +228,7 @@ def merge_acl_table_and_rule(all_config):
     for table in acl_tables:
         acl_tables[table]['rules'] = {}
 
-    for rule in all_config['ACL_RULE']:
+    for rule in all_config.get('ACL_RULE', {}):
         rule_expanded = rule.split('|')
         if len(rule_expanded) == 2:
             table_name = rule_expanded[0]
@@ -239,13 +263,15 @@ def merge_acl_table_and_counter(acl_tables, counters):
 
 def main():
 
-    module = AnsibleModule(argument_spec=dict())
+    module = AnsibleModule(argument_spec=dict(namespace=dict(default=None),))
+    m_args = module.params
+    namespace = m_args['namespace']
 
-    all_config = get_all_config(module)
+    all_config = get_all_config(module, namespace)
     if not all_config:
         module.fail_json(msg='Empty DUT config')
 
-    counters = get_acl_rule_counters(module)
+    counters = get_acl_rule_counters(module, namespace)
 
     acl_tables = merge_acl_table_and_rule(all_config)
     acl_tables = merge_acl_table_and_counter(acl_tables, counters)

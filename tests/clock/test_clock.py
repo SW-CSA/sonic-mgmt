@@ -1,0 +1,484 @@
+import logging
+import random
+import string
+import pytest
+import time
+import datetime as dt
+from collections.abc import Mapping
+
+from tests.common.errors import RunAnsibleModuleFail
+from tests.common.plugins.allure_wrapper import allure_step_wrapper as allure
+from tests.common.utilities import wait_until
+
+pytestmark = [
+    pytest.mark.topology('any'),
+    pytest.mark.sanity_check(skip_sanity=True),
+    pytest.mark.disable_loganalyzer,
+    pytest.mark.skip_check_dut_health,
+    pytest.mark.clock
+]
+
+
+class ClockConsts:
+    DATE = "date"
+    TIME = "time"
+    TIMEZONE = "timezone"
+
+    TEST_TIMEZONE = "Asia/Jerusalem"
+    TIME_MARGIN = 6
+    TIME_MARGIN_MODULAR = 16
+    RANDOM_NUM = 6
+
+    # sonic commands
+    CMD_SHOW_CLOCK = "show clock"
+    CMD_SHOW_CLOCK_TIMEZONES = "show clock timezones"
+    CMD_CONFIG_CLOCK_TIMEZONE = "config clock timezone"
+    CMD_CONFIG_CLOCK_DATE = "config clock date"
+
+    # expected outputs
+    OUTPUT_CMD_SUCCESS = ''
+
+    # expected errors
+    ERR_BAD_TIMEZONE = 'Timezone {} does not conform format'
+    ERR_MISSING_DATE = 'Error: Missing argument "<YYYY-MM-DD>"'
+    ERR_MISSING_TIME = 'Error: Missing argument "<HH:MM:SS>"'
+    ERR_BAD_DATE = 'Date {} does not conform format YYYY-MM-DD'
+    ERR_BAD_TIME = 'Time {} does not conform format HH:MM:SS'
+
+    # timedatectl
+    CMD_TIMEDATECTL = "timedatectl"
+    CMD_GET_TIMEZONE = "timedatectl show --property=Timezone --value"
+    TIME_ZONE = "Time zone"
+
+    MIN_SYSTEM_DATE = "1970-01-01"
+    MAX_SYSTEM_DATE = "2106-02-06"
+
+
+class ClockUtils:
+    @staticmethod
+    def run_cmd(duthosts, cmd, param='', raise_err=False):
+        """
+        @summary:
+            Run a given command and return its output.
+            * A successful command returns an empty output (except for show commands),
+                while failure returns an error message
+        @return: commands output (str)
+        """
+        with allure.step(f'Run command: "{cmd}" with param "{param}"'):
+            duthost = duthosts[0]
+
+            cmd_to_run = cmd if param == '' else cmd + ' ' + param
+            logging.info(f'Actual command to run: "{cmd_to_run}"')
+
+            try:
+                cmd_output = duthost.command(cmd_to_run)["stdout"]
+            except RunAnsibleModuleFail as cmd_err:
+                results = cmd_err.results if isinstance(cmd_err.results, Mapping) else {}
+                fallback_message = (
+                    getattr(cmd_err, "message", None)
+                    or Exception.__str__(cmd_err)
+                    or cmd_err.__class__.__name__
+                )
+                cmd_output = (
+                    results.get("stdout")
+                    or results.get("stderr")
+                    or results.get("msg")
+                    or fallback_message
+                )
+                logging.info(f'Command Error!\nError message: "{cmd_output}"')
+                if raise_err:
+                    raise Exception(cmd_output) from cmd_err
+
+            cmd_output = str(cmd_output)
+            logging.info(f'Output: {cmd_output}')
+
+        return cmd_output
+
+    @staticmethod
+    def get_timezone_name(duthosts):
+        timezone = ClockUtils.run_cmd(
+            duthosts,
+            ClockConsts.CMD_GET_TIMEZONE,
+            raise_err=True
+        ).strip()
+        assert timezone, 'Current system timezone is empty'
+        return timezone
+
+    @staticmethod
+    def verify_and_parse_show_clock_output(show_clock_output):
+        """
+        @summary:
+            Verify, and then split output of show clock into date, time and timezone strings
+
+            Example:
+            "Mon 03 Apr 2023 11:29:46 PM UTC" -> {"date": "2023-04-03", "time": "23:29:46", "timezone": "+0000"}
+        @param show_clock_output: the given show clock output
+        @return: The splited output as a dict
+        """
+        def find_timezone_str_and_matching_format(show_clock_output):
+            """
+            Determine the timezone string and matching datetime format from show_clock_output.
+            Supports multiple formats:
+            - 12-hour: "Thu Feb 20 05:10:25 AM IST 2025" (timezone before year, with AM/PM)
+            - 24-hour: "Thu Feb 20 05:10:25 IST 2025" (timezone before year, no AM/PM)
+            - 24-hour: "Thu 20 Feb 2025 05:10:25 IST" (year before timezone, no AM/PM)
+            - 12-hour: "Thu 20 Feb 2025 05:10:25 AM IST" (year before timezone, with AM/PM)
+            Finds matching tz string and format pair by checking the year and time format.
+            """
+            parts = show_clock_output.split()
+            tz_str1 = parts[-1].strip()  # Last part (e.g., "2025" or "IST")
+            tz_str2 = parts[3].strip()   # Fourth part (e.g., "2025" or "Feb")
+
+            # Year is last (e.g., "2025")
+            if len(tz_str1) == 4 and tz_str1.isdigit():
+                timezone = parts[-2].strip()  # Timezone is second-to-last (e.g., "IST")
+                # Check for AM/PM to determine 12-hour vs 24-hour
+                if "AM" in show_clock_output or "PM" in show_clock_output:
+                    return timezone, '%a %b %d %I:%M:%S %p %Y'  # 12-hour format
+                else:
+                    return timezone, '%a %b %d %H:%M:%S %Y'     # 24-hour format
+
+            # Year is fourth (e.g., "2025")
+            elif len(tz_str2) == 4 and tz_str2.isdigit():
+                timezone = parts[-1].strip()  # Timezone is last (e.g., "UTC")
+                # Assuming it has AM/PM; adjust if 24-hour is possible
+                if "AM" in show_clock_output or "PM" in show_clock_output:
+                    return timezone, '%a %d %b %Y %I:%M:%S %p'  # 12-hour format
+                else:
+                    return timezone, '%a %d %b %Y %H:%M:%S'     # 24-hour format
+
+            else:
+                raise ValueError(f'Cannot find matching timezone string and format for: "{show_clock_output}"')
+
+        with allure.step('Verify output of show clock'):
+            try:
+                timezone_str, parse_format = find_timezone_str_and_matching_format(show_clock_output)
+                # we need to remove timezone string, as datetime has issue parsing some timezone
+                date_time_to_parse = show_clock_output.replace(' ' + timezone_str, '').strip()
+                logging.info(f'Time and date to parse: "{date_time_to_parse}"')
+
+                datetime_obj = dt.datetime.strptime(date_time_to_parse, parse_format)
+                logging.info(f'Datetime object: "{datetime_obj}"\t|\tType: {type(datetime_obj)}')
+            except ValueError:
+                pytest.fail(f'Show clock output is not valid.\nOutput: "{show_clock_output}"')
+
+        with allure.step('Split output of show clock'):
+            res = {
+                ClockConsts.DATE: datetime_obj.strftime("%Y-%m-%d"),
+                ClockConsts.TIME: datetime_obj.strftime("%H:%M:%S"),
+                ClockConsts.TIMEZONE: timezone_str
+            }
+            logging.info(f'res dict: {res}')
+
+            return res
+
+    @staticmethod
+    def parse_linux_cmd_output(linux_cmd_output):
+        """
+        @summary:
+            Parse output of a linux command.
+
+            Example:
+                timedatectl's output:
+                            "Local time: Tue 2023-04-04 08:22:01 MDT
+                           Universal time: Tue 2023-04-04 14:22:01 UTC
+                                 RTC time: Tue 2023-04-04 14:22:01
+                                Time zone: America/Inuvik (MDT, -0600)
+                System clock synchronized: no
+                              NTP service: n/a
+                          RTC in local TZ: no"
+
+                will become:
+                {
+                    "Local time": "Tue 2023-04-04 08:22:01 MDT",
+                    "Universal time": "Tue 2023-04-04 14:22:01 UTC",
+                    ...
+                }
+        @param linux_cmd_output: given output of a linux command (str)
+        @return: dictionary as mentioned in the example
+        """
+        with allure.step('Parse linux command output into dictionary'):
+            rows = [row.strip() for row in linux_cmd_output.split('\n')]  # split by rows
+            logging.info(f'rows: {rows}')
+            res_dict = {}
+            for row in rows:
+                logging.debug(f'row: "{row}"')
+                row_split = row.split(':', 1)
+                res_dict[row_split[0]] = row_split[1].strip()
+            logging.info(f'Result dict:\n{res_dict}')
+            return res_dict
+
+    @staticmethod
+    def get_valid_timezones(duthosts):
+        """
+        @summary:
+            Get the list of valid timezones from 'show clock timezones' command
+        @param duthosts: duthosts object
+        @return: list of timezones (strings)
+        """
+        with allure.step('Get list of valid timezones from show clock timezones command'):
+            return ClockUtils.run_cmd(duthosts=duthosts, cmd=ClockConsts.CMD_SHOW_CLOCK_TIMEZONES).split()
+
+    @staticmethod
+    def verify_timezone_value(duthosts, expected_tz_name):
+        """
+        @summary:
+            Verify that current system timezone is as expected.
+            * Assume that expected timezone should be given as a complete timezone name (ETC/UTC, Asia/Jerusalem, etc.)
+        @param duthosts: duthosts object
+        @param expected_tz_name: The expected timezone name
+        """
+        with allure.step(f'Verify that current system timezone is as expected ({expected_tz_name})'):
+            with allure.step('Get timezone details from show clock and timedatectl commands'):
+                show_clock_output = ClockUtils.run_cmd(duthosts, ClockConsts.CMD_SHOW_CLOCK)
+                show_clock_tz_abbr = ClockUtils.verify_and_parse_show_clock_output(
+                    show_clock_output)[ClockConsts.TIMEZONE]
+                timedatectl_tz = ClockUtils.parse_linux_cmd_output(
+                    ClockUtils.run_cmd(duthosts, ClockConsts.CMD_TIMEDATECTL))[ClockConsts.TIME_ZONE]
+                timedatectl_tz_split = timedatectl_tz.split(' ', 1)
+                timedatectl_tz_name = timedatectl_tz_split[0].strip()
+                timedatectl_tz_abbr = timedatectl_tz_split[1].split(',', 1)[0].replace('(', '').strip()
+
+            with allure.step(f'Compare timezone abbreviations of show clock ({show_clock_tz_abbr}) '
+                             f'and timedatectl ({timedatectl_tz_abbr})'):
+                assert timedatectl_tz_abbr == show_clock_tz_abbr, \
+                    'Expected: {timedatectl_tz_abbr} == {show_clock_tz_abbr}'
+
+            with allure.step(f'Compare timezone name from timedatectl ({timedatectl_tz_name}) '
+                             f'to the expected ({expected_tz_name})'):
+                assert timedatectl_tz_name == expected_tz_name, f'Expected: {timedatectl_tz_name} == {expected_tz_name}'
+        return True
+
+    @staticmethod
+    def select_random_date():
+        """
+        @summary:
+            Select a random date
+        @return: a random date as string in the format "YYYY-MM-DD"
+        """
+        with allure.step('Select a random date'):
+            start_date = dt.date.fromisoformat(ClockConsts.MIN_SYSTEM_DATE)
+            end_date = dt.date.fromisoformat(ClockConsts.MAX_SYSTEM_DATE)
+            diff_days = (end_date - start_date).days
+            rand_num_of_days = random.randint(0, diff_days)
+            rand_date = start_date + dt.timedelta(days=rand_num_of_days)
+            rand_date_str = rand_date.strftime('%Y-%m-%d')
+            logging.info(f'Selected random date: "{rand_date_str}"')
+            return rand_date_str
+
+    @staticmethod
+    def select_random_time():
+        """
+        @summary:
+            Select a random time
+        @return: a random date as string in the format "hh:mm:ss"
+        """
+        with allure.step('Select a random time in a day'):
+            rand_num_of_seconds_since_00 = random.randint(0, 24 * 60 * 60 - 1)
+
+            rand_time_obj = time.gmtime(rand_num_of_seconds_since_00)
+
+            rand_time_str = time.strftime("%H:%M:%S", rand_time_obj)
+
+            logging.info(f'Selected random time: "{rand_time_str}"')
+            return rand_time_str
+
+    @staticmethod
+    def verify_datetime(expected, actual, allowed_margin=ClockConsts.TIME_MARGIN, elapsed_seconds=0):
+        """
+        @summary:
+            Asserts a given date-time value is as expected
+            * expected and actual date-time values are strings in the format "YYYY-MM-DD HH:MM:SS"
+        @param expected: expected date-time value
+        @param actual: actual given date-time value
+        @param allowed_margin: allowed clock error (in seconds)
+        @param elapsed_seconds: time spent between issuing and observing the commands
+        """
+        with allure.step(
+                f'Verify that "{actual}" is within {-allowed_margin} to '
+                f'{allowed_margin + elapsed_seconds} seconds of "{expected}"'):
+            with allure.step(f'Calculate delta between "{expected}" and "{actual}" in seconds'):
+                datetime_obj1 = dt.datetime.strptime(expected, "%Y-%m-%d %H:%M:%S")
+                datetime_obj2 = dt.datetime.strptime(actual, "%Y-%m-%d %H:%M:%S")
+
+                diff_seconds = (datetime_obj2 - datetime_obj1).total_seconds()
+
+            with allure.step(f'Verify that actual delta {diff_seconds} is within the allowed range'):
+                assert -allowed_margin <= diff_seconds <= allowed_margin + elapsed_seconds, \
+                    f'Expected: {-allowed_margin} <= {diff_seconds} <= {allowed_margin + elapsed_seconds}'
+
+
+def test_show_clock(duthosts):
+    """
+    @summary:
+        Test that show clock output is correct
+
+        Steps:
+        1. Run show clock
+        2. Validate info
+    """
+    with allure.step('Run show clock command'):
+        show_clock_output = ClockUtils.run_cmd(duthosts=duthosts, cmd=ClockConsts.CMD_SHOW_CLOCK)
+
+    with allure.step('Verify info is valid'):
+        ClockUtils.verify_and_parse_show_clock_output(show_clock_output)
+
+
+def test_config_clock_timezone(duthosts, init_timezone):
+    """
+    @summary:
+        Check that 'config clock timezone' command works correctly
+
+        Steps:
+        1. Set a new valid timezone
+        2. Verify timezone changed
+        3. Set invalid timezone
+        4. Verify timezone hasn't changed
+    """
+    valid_timezones = ClockUtils.get_valid_timezones(duthosts)
+    orig_timezone = ClockUtils.get_timezone_name(duthosts)
+    refresh_recovery = init_timezone
+
+    with allure.step('Select a random new valid timezone'):
+        new_timezone = random.choice(valid_timezones)
+        while new_timezone == orig_timezone:
+            new_timezone = random.choice(valid_timezones)
+
+    with allure.step(f'Set the new timezone "{new_timezone}"'):
+        refresh_recovery()
+        output = ClockUtils.run_cmd(duthosts, ClockConsts.CMD_CONFIG_CLOCK_TIMEZONE, new_timezone)
+        with allure.step('Verify command success'):
+            assert output == ClockConsts.OUTPUT_CMD_SUCCESS, \
+                f'Expected: "{output}" == "{ClockConsts.OUTPUT_CMD_SUCCESS}"'
+
+    with allure.step(f'Verify timezone changed to "{new_timezone}"'):
+        assert wait_until(
+            timeout=120,
+            interval=5,
+            delay=10,
+            condition=lambda: ClockUtils.verify_timezone_value(
+                duthosts,
+                expected_tz_name=new_timezone
+            )
+        ), f'Timezone did not change to "{new_timezone}"'
+
+    with allure.step('Select a random string as invalid timezone'):
+        invalid_timezone = ''.join(random.choice(string.ascii_lowercase) for _ in range(random.randint(1, 10)))
+        while invalid_timezone in valid_timezones:
+            invalid_timezone = ''.join(random.choice(string.ascii_lowercase) for _ in range(random.randint(1, 10)))
+        logging.info(f'Selected invalid timezone: "{invalid_timezone}"')
+
+    with allure.step(f'Try to set the invalid timezone "{invalid_timezone}"'):
+        refresh_recovery()
+        output = ClockUtils.run_cmd(duthosts, ClockConsts.CMD_CONFIG_CLOCK_TIMEZONE, invalid_timezone)
+
+    with allure.step('Verify command failure'):
+        expected_err = ClockConsts.ERR_BAD_TIMEZONE.format(invalid_timezone)
+        assert expected_err in output, \
+            f'Error: The given string does not contain the expected substring.\n' \
+            f'Expected substring: "{expected_err}"\n' \
+            f'Given (whole) string: "{output}"'
+
+    with allure.step('Verify timezone has not changed'):
+        ClockUtils.verify_timezone_value(duthosts, expected_tz_name=new_timezone)
+
+
+def test_config_clock_date(duthosts, restore_time, tbinfo):
+    """
+    @summary:
+        Check that 'config clock date' command works correctly
+
+        Steps:
+        1. Set a new valid date and time using the command
+        2. Verify date and time changed
+        3. Try to set invalid date and time
+        4. Verify error and that time hasn't changed
+    """
+    # add extra time margin for t2 topo
+    is_modular_chassis = duthosts[0].get_facts().get("modular_chassis")
+    time_margin = ClockConsts.TIME_MARGIN_MODULAR if is_modular_chassis else ClockConsts.TIME_MARGIN
+    refresh_recovery = restore_time
+    with allure.step('Select valid date and time to set'):
+        new_date = dt.datetime.today() + dt.timedelta(days=1)
+        new_time = ClockUtils.select_random_time()
+        new_datetime = new_date.strftime('%Y-%m-%d') + ' ' + new_time
+
+    with allure.step(f'Set new date and time "{new_datetime}"'):
+        refresh_recovery()
+        command_start = time.monotonic()
+        output = ClockUtils.run_cmd(duthosts, ClockConsts.CMD_CONFIG_CLOCK_DATE, new_datetime)
+
+    with allure.step('Verify command success'):
+        assert output == ClockConsts.OUTPUT_CMD_SUCCESS, f'Expected: "{output}" == "{ClockConsts.OUTPUT_CMD_SUCCESS}"'
+
+    with allure.step(f'Verify date and time changed to "{new_datetime}"'):
+        with allure.step('Get datetime from show clock'):
+            show_clock_output = ClockUtils.run_cmd(duthosts, ClockConsts.CMD_SHOW_CLOCK)
+            elapsed_seconds = time.monotonic() - command_start
+            show_clock_dict = ClockUtils.verify_and_parse_show_clock_output(show_clock_output)
+
+        with allure.step('Verify date-time'):
+            cur_date = show_clock_dict[ClockConsts.DATE]
+            cur_time = show_clock_dict[ClockConsts.TIME]
+            cur_datetime = f'{cur_date} {cur_time}'
+
+            ClockUtils.verify_datetime(
+                expected=new_datetime, actual=cur_datetime,
+                allowed_margin=time_margin, elapsed_seconds=elapsed_seconds
+            )
+
+    with allure.step('Select random string as invalid input'):
+        rand_str = ''.join(random.choice(string.ascii_lowercase) for _ in range(ClockConsts.RANDOM_NUM))
+        logging.info(f'Selected random string: "{rand_str}"')
+
+    with allure.step('Try to set invalid inputs'):
+        errors = {
+            '': ClockConsts.ERR_MISSING_DATE,
+            rand_str: ClockConsts.ERR_MISSING_TIME,
+            f'{rand_str} {rand_str}': f'{ClockConsts.ERR_BAD_DATE.format(rand_str)}\n'
+                                      f'{ClockConsts.ERR_BAD_TIME.format(rand_str)}',
+            f'{rand_str} {new_time}': ClockConsts.ERR_BAD_DATE.format(rand_str),
+            f'{new_date.strftime("%Y-%m-%d")} {rand_str}': ClockConsts.ERR_BAD_TIME.format(rand_str)
+        }
+
+        for invalid_input, err_msg in errors.items():
+            logging.info(f'Invalid input: "{invalid_input}"\nExpected error:\n{err_msg}')
+            refresh_recovery()
+
+            with allure.step('Get show clock output before running the config command'):
+                command_start = time.monotonic()
+                show_clock_output_before = ClockUtils.run_cmd(duthosts, ClockConsts.CMD_SHOW_CLOCK)
+
+            with allure.step(f'Try to set "{invalid_input}"'):
+                output = ClockUtils.run_cmd(duthosts, ClockConsts.CMD_CONFIG_CLOCK_DATE, invalid_input)
+
+            with allure.step('Get show clock output after running the config command'):
+                show_clock_output_after = ClockUtils.run_cmd(duthosts, ClockConsts.CMD_SHOW_CLOCK)
+                elapsed_seconds = time.monotonic() - command_start
+
+            with allure.step('Verify command failure'):
+                normalized_output = output.replace("'", '"')
+                assert err_msg in normalized_output, \
+                    f'Error: The given string does not contain the expected substring.\n' \
+                    f'Expected substring: "{err_msg}"\n' \
+                    f'Given (whole) string: "{output}"'
+
+            with allure.step(f'Verify date and time have not changed (still "{new_datetime}")'):
+                show_clock_dict_before = ClockUtils.verify_and_parse_show_clock_output(show_clock_output_before)
+                show_clock_dict_after = ClockUtils.verify_and_parse_show_clock_output(show_clock_output_after)
+
+                with allure.step('Verify date-time'):
+                    date_before = show_clock_dict_before[ClockConsts.DATE]
+                    time_before = show_clock_dict_before[ClockConsts.TIME]
+                    datetime_before = f'{date_before} {time_before}'
+
+                    date_after = show_clock_dict_after[ClockConsts.DATE]
+                    time_after = show_clock_dict_after[ClockConsts.TIME]
+                    datetime_after = f'{date_after} {time_after}'
+
+                    ClockUtils.verify_datetime(
+                        expected=datetime_before,
+                        actual=datetime_after,
+                        allowed_margin=time_margin,
+                        elapsed_seconds=elapsed_seconds
+                    )

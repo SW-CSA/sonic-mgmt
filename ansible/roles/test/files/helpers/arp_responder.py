@@ -1,3 +1,4 @@
+import scapy.all as scapy2
 import binascii
 import socket
 import struct
@@ -6,18 +7,34 @@ import json
 import argparse
 import os.path
 from fcntl import ioctl
-from pprint import pprint
+import logging
+logging.getLogger("scapy.runtime").setLevel(logging.ERROR)
+scapy2.conf.use_pcap = True
+# pcapdnet has been renamed to libpcap from scapy 2.4.5
+try:
+    import scapy.arch.pcapdnet  # noqa: F401
+except ImportError:
+    import scapy.arch.libpcap   # noqa: F401
+
+
+# Canonical default config path for the arp_responder helper. This must stay in
+# lock-step with tests.common.helpers.constants.ARP_RESPONDER_DEFAULT_CONFIG;
+# we don't import it here because this script runs inside the PTF container,
+# where the sonic-mgmt test tree is not on sys.path.
+DEFAULT_CONFIG_PATH = '/tmp/from_t1.json'
 
 
 def hexdump(data):
-    print " ".join("%02x" % ord(d) for d in data)
+    print(" ".join("%02x" % ord(d) for d in data))
+
 
 def get_if(iff, cmd):
     s = socket.socket()
-    ifreq = ioctl(s, cmd, struct.pack("16s16x",iff))
+    ifreq = ioctl(s, cmd, struct.pack("16s16x", str(iff).encode("utf-8")))
     s.close()
 
     return ifreq
+
 
 def get_mac(iff):
     SIOCGIFHWADDR = 0x8927          # Get hardware address
@@ -39,18 +56,18 @@ class Interface(object):
             self.socket.close()
 
     def bind(self):
-        self.socket = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(self.ETH_P_ALL))
-        self.socket.bind((self.iface, 0))
-        self.socket.settimeout(self.RCV_TIMEOUT)
+        self.socket = scapy2.conf.L2listen(iface=self.iface, filter='arp')
 
     def handler(self):
-        return self.socket.fileno()
+        return self.socket
 
     def recv(self):
-        return self.socket.recv(self.RCV_SIZE)
+        sniffed = self.socket.recv()
+        pkt = sniffed[0]
+        return bytes(pkt)
 
     def send(self, data):
-        self.socket.send(data)
+        scapy2.sendp(data, iface=self.iface)
 
     def mac(self):
         return self.mac_address
@@ -64,7 +81,7 @@ class Poller(object):
         self.responder = responder
         self.mapping = {}
         for interface in interfaces:
-            self.mapping[interface.handler()] = interface 
+            self.mapping[interface.handler()] = interface
 
     def poll(self):
         handlers = self.mapping.keys()
@@ -75,10 +92,12 @@ class Poller(object):
 
 
 class ARPResponder(object):
-    ARP_PKT_LEN = 60
+    ARP_PKT_LEN = 64
     ARP_OP_REQUEST = 1
+
     def __init__(self, ip_sets):
-        self.arp_chunk = binascii.unhexlify('08060001080006040002') # defines a part of the packet for ARP Reply
+        # defines a part of the packet for ARP Reply
+        self.arp_chunk = binascii.unhexlify('08060001080006040002')
         self.arp_pad = binascii.unhexlify('00' * 18)
 
         self.ip_sets = ip_sets
@@ -90,7 +109,8 @@ class ARPResponder(object):
         if len(data) > self.ARP_PKT_LEN:
             return
 
-        remote_mac, remote_ip, request_ip, op_type = self.extract_arp_info(data)
+        remote_mac, remote_ip, request_ip, op_type, vlan_id = self.extract_arp_info(
+            data)
 
         # Don't send ARP response if the ARP op code is not request
         if op_type != self.ARP_OP_REQUEST:
@@ -99,20 +119,34 @@ class ARPResponder(object):
         request_ip_str = socket.inet_ntoa(request_ip)
         if request_ip_str not in self.ip_sets[interface.name()]:
             return
-
-        if 'vlan' in self.ip_sets[interface.name()]:
-            vlan_id = self.ip_sets[interface.name()]['vlan']
-        else:
-            vlan_id = None
-
-        arp_reply = self.generate_arp_reply(self.ip_sets[interface.name()][request_ip_str], remote_mac, request_ip, remote_ip, vlan_id)
+        arp_reply = self.generate_arp_reply(self.ip_sets[interface.name(
+        )][request_ip_str], remote_mac, request_ip, remote_ip, vlan_id)
         interface.send(arp_reply)
 
         return
-        
+
     def extract_arp_info(self, data):
         # remote_mac, remote_ip, request_ip, op_type
-        return data[6:12], data[28:32], data[38:42], (ord(data[20]) * 256 + ord(data[21]))
+        rem_ip_start = 28
+        req_ip_start = 38
+        op_type_start = 20
+        eth_offset = 0
+        vlan_id = None
+        ether_type = data[12:14].hex()
+        if (ether_type == '8100'):
+            vlan = data[14:16].hex()
+            if (vlan != '0000'):
+                eth_offset = 4
+                vlan_id = data[14:16]
+        rem_ip_start = rem_ip_start + eth_offset
+        req_ip_start = req_ip_start + eth_offset
+        op_type_start = op_type_start + eth_offset
+        rem_ip_end = rem_ip_start + 4
+        req_ip_end = req_ip_start + 4
+        op_type_end = op_type_start + 1
+
+        return data[6:12], data[rem_ip_start:rem_ip_end], data[req_ip_start:req_ip_end], \
+            ((data[op_type_start]) * 256 + data[op_type_end]), vlan_id
 
     def generate_arp_reply(self, local_mac, remote_mac, local_ip, remote_ip, vlan_id):
         eth_hdr = remote_mac + local_mac
@@ -122,19 +156,23 @@ class ARPResponder(object):
 
         return eth_hdr + self.arp_chunk + local_mac + local_ip + remote_mac + remote_ip + self.arp_pad
 
+
 def parse_args():
     parser = argparse.ArgumentParser(description='ARP autoresponder')
-    parser.add_argument('--conf', '-c', type=str, dest='conf', default='/tmp/from_t1.json', help='path to json file with configuration')
-    parser.add_argument('--extended', '-e', action='store_true', dest='extended', default=False, help='enable extended mode')
+    parser.add_argument('--conf', '-c', type=str, dest='conf',
+                        default=DEFAULT_CONFIG_PATH, help='path to json file with configuration')
+    parser.add_argument('--extended', '-e', action='store_true',
+                        dest='extended', default=False, help='enable extended mode')
     args = parser.parse_args()
 
     return args
+
 
 def main():
     args = parse_args()
 
     if not os.path.exists(args.conf):
-        print "Can't find file %s" % args.conf
+        print("Can't find file %s" % args.conf)
         return
 
     with open(args.conf) as fp:
@@ -149,7 +187,8 @@ def main():
             iface, vlan = iface.split('@')
             vlan_tag = format(int(vlan), 'x')
             vlan_tag = vlan_tag.zfill(4)
-        ip_sets[str(iface)] = {}
+        if str(iface) not in ip_sets:
+            ip_sets[str(iface)] = {}
         if args.extended:
             for ip, mac in ip_dict.items():
                 ip_sets[str(iface)][str(ip)] = binascii.unhexlify(str(mac))
@@ -172,6 +211,7 @@ def main():
     p.poll()
 
     return
+
 
 if __name__ == '__main__':
     main()

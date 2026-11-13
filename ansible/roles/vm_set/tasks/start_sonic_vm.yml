@@ -1,17 +1,62 @@
-- name: Create directory for vm images and vm disks
-  file: path={{ item }} state=directory mode=0755
-  with_items:
-    - "sonic-vm/images"
-    - "sonic-vm/disks"
+- set_fact:
+    sonic_vm_storage_location: "{{ home_path }}/sonic-vm"
+  when: sonic_vm_storage_location is not defined
 
 - set_fact:
-    src_disk_image: "{{ home_path }}/sonic-vm/images/sonic-vs.img"
-    disk_image: "{{ home_path }}/sonic-vm/disks/sonic_{{ dut_name }}.img"
+    disable_updategraph: False
+  when: disable_updategraph is not defined
+
+- set_fact:
+    use_uefi: False
+  when: use_uefi is not defined
+
+- name: Check if images folder exists
+  stat: path={{ sonic_vm_storage_location }}/images
+  register: images_folder_stat
+
+- name: Check if discs folder exists
+  stat: path={{ sonic_vm_storage_location }}/disks
+  register: discs_folder_stat
+
+- name: Create directory for vm images
+  file: path={{ item }} state=directory mode=0755
+  with_items:
+    - "{{ sonic_vm_storage_location }}/images"
+  when: not images_folder_stat.stat.exists
+
+- name: Create directory for vm disks
+  file: path={{ item }} state=directory mode=0755
+  with_items:
+    - "{{ sonic_vm_storage_location }}/disks"
+  when: not discs_folder_stat.stat.exists
+
+- set_fact:
+    disk_image: "{{ sonic_vm_storage_location }}/disks/sonic_{{ dut_name }}.img"
+    efi_vars: "{{ sonic_vm_storage_location }}/disks/sonic_{{ dut_name }}_vars.fd"
     mgmt_ip_address: " {{ hostvars[dut_name]['ansible_host'] }}"
-    serial_port: 9000
+    mgmt_gw: "{{ vm_mgmt_gw | default(mgmt_gw) }}"
+    serial_port: "{{ hostvars[dut_name]['serial_port'] }}"
+    hwsku: "{{ hostvars[dut_name].hwsku }}"
+    num_asic: "{{ hostvars[dut_name]['num_asics'] | default(1) }}"
+    card_type: "{{ hostvars[dut_name]['card_type'] | default('pizzabox') }}"
+    # See get_dut_port.yml for the rationale behind these two port_alias inputs.
+    include_internal: "{{ hostvars[dut_name]['card_type'] is defined
+      or hostvars[dut_name]['switch_type'] | default('') == 'voq' }}"
+    sort_by_index: "{{ hostvars[dut_name]['card_type'] is not defined
+      and hostvars[dut_name]['switch_type'] | default('') != 'voq' }}"
+    asic_type: "{{ hostvars[dut_name].asic_type | default('') }}"
+
+- set_fact:
+    src_disk_image: "{{ lookup('env', 'SONIC_MGMT_SONIC_KVM_IMAGE') | default(sonic_vm_storage_location ~ '/images/sonic-' ~ ('vpp' if 'vpp' == asic_type else 'vs') ~ '.img', true) }}"
+    src_disk_efi_vars: "{{ lookup('env', 'SONIC_MGMT_SONIC_EFI_VARS') | default(sonic_vm_storage_location ~ '/images/sonic-' ~ ('vpp' if 'vpp' == asic_type else 'vs') ~ '_vars.fd', true) }}"
+
+- name: Remove arp entry for {{ dut_name }}
+  shell: arp -d {{ mgmt_ip_address }}
+  become: yes
+  ignore_errors: yes
 
 - name: Device debug output
-  debug: msg="hostname = {{ dut_name }} serial port = {{ serial_port }} ip = {{ mgmt_ip_address }}"
+  debug: msg="hostname = {{ dut_name }} serial port = {{ serial_port }} ip = {{ mgmt_ip_address }}/{{ mgmt_prefixlen }} mgmt_gw = {{ mgmt_gw }}"
 
 - name: Check destination file existance
   stat: path={{ disk_image }}
@@ -21,11 +66,15 @@
   copy: src={{ src_disk_image }} dest={{ disk_image }} remote_src=True
   when: not file_stat.stat.exists
 
-- name: Get DUT port alias
-  port_alias: hwsku={{ hostvars[dut_name].hwsku }}
-  connection: local
+- name: Copy sonic EFI vars for {{ dut_name }}
+  copy: src={{ src_disk_efi_vars }} dest={{ efi_vars }} remote_src=True
+  when: not file_stat.stat.exists and use_uefi
 
-- name: Define vm {{ dut_name }}
+- name: Get DUT port alias
+  port_alias: hwsku={{ hwsku }} num_asic={{ num_asic }} card_type={{ card_type }} include_internal={{ include_internal | default(false) }} sort_by_index={{ sort_by_index | default(true) }}
+  delegate_to: localhost
+
+- name: Define SONiC vm {{ dut_name }}
   virt: name={{ dut_name }}
         command=define
         xml="{{ lookup('template', 'templates/sonic.xml.j2') }}"
@@ -33,12 +82,13 @@
   when: dut_name not in vm_list_defined.list_vms
   become: yes
 
-- name: Start vm {{ dut_name }}
+- name: Start SONiC vm {{ dut_name }}
   virt: name={{ dut_name }}
         state=running
         uri=qemu:///system
   when: dut_name not in vm_list_running.list_vms
   become: yes
+  register: sonic_vm_start
 
 - name: Wait until vm {{ dut_name }} is loaded
   sonic_kickstart: telnet_port={{ serial_port }}
@@ -48,6 +98,7 @@
              mgmt_ip="{{ mgmt_ip_address }}/{{ mgmt_prefixlen }}"
              mgmt_gw={{ vm_mgmt_gw | default(mgmt_gw) }}
              new_password={{ sonic_password }}
+             num_asic={{ num_asic }}
   register: kickstart_output
 
 - name: Fail if kickstart gives error for {{ dut_name }}

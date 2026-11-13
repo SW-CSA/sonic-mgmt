@@ -1,5 +1,10 @@
 #!/usr/bin/python
 
+import netaddr
+from collections import defaultdict
+from ansible.module_utils.basic import AnsibleModule
+import json
+import re
 DOCUMENTATION = '''
 module:  bgp_route
 version_added:  "2.0"
@@ -68,7 +73,8 @@ SAMPLE_COMMAND_DATA = '''
    BGP routing table entry for 192.168.10.1/32
    Paths: (8 available, best #8, table Default-IP-Routing-Table)
    Advertised to non peer-group peers:
-     10.0.0.1 10.0.0.5 10.0.0.13 10.0.0.17 10.0.0.21 10.0.0.25 10.0.0.29 10.0.0.51 10.0.0.53 10.0.0.55 10.0.0.57 10.0.0.59 10.0.0.61 10.0.0.63
+     10.0.0.1 10.0.0.5 10.0.0.13 10.0.0.17 10.0.0.21 10.0.0.25 10.0.0.29
+     10.0.0.51 10.0.0.53 10.0.0.55 10.0.0.57 10.0.0.59 10.0.0.61 10.0.0.63
      65200 62011 65501
      10.0.0.17 from 10.0.0.17 (100.1.0.9)
         Origin incomplete, localpref 100, valid, external, multipath
@@ -141,12 +147,14 @@ SAMPLE_COMMAND_DATA = '''
 '''
 
 
-### TODO: Not fully tested ipv6 route entries parsing option, need continue working on ipv6 specific commands###
+# TODO: Not fully tested ipv6 route entries parsing option, need continue working on ipv6 specific commands###
+
 
 class BgpRoutes(object):
     '''
         parsing bgp routing information
     '''
+
     def __init__(self, neighbor=None, direction=None, prefix=None):
         self.facts = defaultdict(dict)
         self.neighbor = neighbor
@@ -157,16 +165,34 @@ class BgpRoutes(object):
     def get_facts(self):
         return self.facts
 
+    def parse_bgp_route_adv_json(self, cmd_result):
+        '''
+        parse BGP routing facts of neighbor advertised routes in json format
+        '''
+
+        self.facts['bgp_route_neiadv']['neighbor'] = self.neighbor
+
+        res = json.loads(cmd_result)
+
+        for k, rt in res['advertisedRoutes'].items():
+            entry = dict()
+            entry['nexthop'] = rt['nextHop']
+            entry['origin'] = rt.get('bgpOriginCode', rt['origin'])  # Use bgpOriginCode if present, else origin
+            entry['weigh'] = rt['weight']
+            entry['aspath'] = rt['path'].split()
+            self.facts['bgp_route_neiadv']["{}/{}".format(
+                rt['addrPrefix'], rt['prefixLen'])] = entry
+
     def parse_bgp_route_adv(self, cmd_result):
         '''
         parse BGP routing facts of neighbor advertised routes
         '''
         self.facts['bgp_route_neiadv']['neighbor'] = self.neighbor
-        ### so far parsing prefix, nexthop and aspath, origin and weight 
+        # so far parsing prefix, nexthop and aspath, origin and weight
         header = 'Metric LocPrf Weight Path'
         result_lines = cmd_result.split('\n')
         table_start = False
-        re_aspath = re.compile('.*\s{2,}(\d+)\s((\d+\s)+)?([ie\?])$')
+        re_aspath = re.compile(r'.*\s{2,}(\d+)\s((\d+\s)+)?([ie\?])$')
         while len(result_lines) != 0:
             line = result_lines.pop(0)
             if not table_start:
@@ -174,15 +200,15 @@ class BgpRoutes(object):
                     table_start = True
                     continue
             else:
-                ## only parse valid route entry, ignore if it's not marked as valid
-                if not re.match('^\*', line):
+                # only parse valid route entry, ignore if it's not marked as valid
+                if not re.match(r'^\*', line):
                     continue
                 entry = dict()
                 fields = line.strip().split()
                 prefix = fields[1]
-                if len(fields) > 2:    ### route entry in one line
+                if len(fields) > 2:  # route entry in one line
                     nexthop = fields[2]
-                else:                  ### route entry in two lines
+                else:  # route entry in two lines
                     line = result_lines.pop(0)
                     nexthop = line.strip().split()[0]
                 m = re_aspath.match(line)
@@ -199,14 +225,35 @@ class BgpRoutes(object):
                     entry['weight'] = weight
                 self.facts['bgp_route_neiadv'][prefix] = entry
 
+    def parse_bgp_route_prefix_json(self, cmd_result):
+        """
+        parse BGP facts for specific prefix in json format
+        """
+
+        prefix = self.prefix
+        self.facts['bgp_route'] = defaultdict(dict)
+
+        p = json.loads(cmd_result)
+
+        if 'prefix' not in p:
+            self.facts['bgp_route'][prefix]['found'] = False
+            return
+
+        self.facts['bgp_route'][prefix]['found'] = True
+        self.facts['bgp_route'][prefix]['aspath'] = []
+        self.facts['bgp_route'][prefix]['path_num'] = len(p['paths'])
+        for path in p['paths']:
+            self.facts['bgp_route'][prefix]['aspath'].append(
+                path['aspath']['string'])
 
     def parse_bgp_route_prefix(self, cmd_result):
         '''
         parse BGP facts for specific prefix
         '''
         # BGP route preix line parsing state
-        # search_state = [HEADER, PATH_PROPERTIES, PEER_GROUP_HEADER, PEER_GROUPS, PREFIX_PATHS, PREFIX_PATHS_FROM, PREFIX_PATH_ORIGIN, PREFIX_PATH_TIMESTAMP, ERR]
-        HEADER  = 1
+        # search_state = [HEADER, PATH_PROPERTIES, PEER_GROUP_HEADER, PEER_GROUPS, PREFIX_PATHS,
+        #                 PREFIX_PATHS_FROM, PREFIX_PATH_ORIGIN, PREFIX_PATH_TIMESTAMP, ERR]
+        HEADER = 1
         PATH_PROPERTIES = 2
         PEER_GROUP_HEADER = 3
         PEER_GROUPS = 4
@@ -218,13 +265,13 @@ class BgpRoutes(object):
         # line content pattern
         prefix = self.prefix
         regex_prefix_header = re.compile('BGP routing table entry for ')
-        regex_prefix_avail_paths = re.compile('Paths:\s+\((\d+)\s+available')
-        prefix_peer_group_header = 'Advertised to non peer-group peers:'
-        regex_prefix_peers = re.compile('^[0-9a-fA-F.:\s]+$')
-        regex_prefix_paths = re.compile('^[0-9\s]+$|Local')
-        regex_prefix_path_p1_from = re.compile('.* from .*\([0-9a-fA-F.:]+\)')
-        regex_prefix_path_p2_origin = re.compile('\s+Origin')
-        regex_prefix_path_p3_timestamp = re.compile('\s+Last update:')
+        regex_prefix_avail_paths = re.compile(r'Paths:\s+\((\d+)\s+available')
+        regex_prefix_peers = re.compile(r'^[0-9a-fA-F.:\s]+$')
+        regex_prefix_paths = re.compile(r'^[0-9\s]+$|Local')
+        regex_prefix_path_p1_from = re.compile(r'.* from .*\([0-9a-fA-F.:]+\)')
+        regex_prefix_path_p2_origin = re.compile(r'\s+Origin')
+        regex_prefix_path_p3_timestamp = re.compile(r'\s+Last update:')
+        regex_prefix_path_p3_community = re.compile(r'\s+Community:')
         cmd_err1 = 'Unknown command'
         cmd_err2 = 'Network not in table'
 
@@ -257,9 +304,9 @@ class BgpRoutes(object):
                     state = PEER_GROUP_HEADER
                 else:
                     state = ERR
-            elif  state == PEER_GROUP_HEADER:
+            elif state == PEER_GROUP_HEADER:
                 state = PEER_GROUPS
-            elif  state == PEER_GROUPS:
+            elif state == PEER_GROUPS:
                 if regex_prefix_peers.match(line):
                     state = PREFIX_PATHS
                 else:
@@ -284,65 +331,104 @@ class BgpRoutes(object):
             elif state == PREFIX_PATH_TIMESTAMP:
                 if regex_prefix_path_p3_timestamp.match(line):
                     state = PREFIX_PATHS
+                elif regex_prefix_path_p3_community.match(line):
+                    continue
                 else:
                     state = ERR
             elif state == ERR:
-                raise Exception("cannot parse bgp prefix info correctly " + str(state) + str(self.facts))
+                raise Exception(
+                    "cannot parse bgp prefix info correctly " + str(state) + str(self.facts))
 
 
 def main():
     module = AnsibleModule(
-            argument_spec=dict(
-                neighbor=dict(required=False, default=None),
-                direction=dict(required=False, choices=['adv', 'rec']),
-                prefix=dict(required=False, default=None)
-                ),
-            supports_check_mode=False
-            )
+        argument_spec=dict(
+            neighbor=dict(required=False, default=None),
+            direction=dict(required=False, choices=['adv', 'rec']),
+            prefix=dict(required=False, default=None),
+            namespace_id=dict(required=False, type='int', default=None)
+        ),
+        supports_check_mode=False
+    )
+    is_frr = False
+    use_json = ""
+
     m_args = module.params
     neighbor = m_args['neighbor']
     direction = m_args['direction']
     prefix = m_args['prefix']
-    regex_ip = re.compile('[0-9a-fA-F.:]+')
-    regex_iprange = re.compile('[0-9a-fA-F.:]+\/\d+')
-    regex_ipv4 = re.compile('[12][0-9]{0,2}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\/?\d+?')
-    if neighbor == None and direction == None and prefix == None:
-        module.fail_json(msg="No support of parsing 'show ip bgp' full prefix table yet")
+    ns_id = "" if m_args['namespace_id'] is None else m_args['namespace_id']
+    regex_ipv4 = re.compile(
+        r'[12][0-9]{0,2}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\/?\d+?')
+
+    vtysh_cmd = "docker exec -i bgp{} vtysh -c".format(ns_id)
+
+    if neighbor is None and direction is None and prefix is None:
+        module.fail_json(
+            msg="No support of parsing 'show ip bgp' full prefix table yet")
         return
     if neighbor and ((not netaddr.valid_ipv4(neighbor)) and (not netaddr.valid_ipv6(neighbor))):
         err_message = "Invalid neighbor address %s ??" % neighbor
         module.fail_json(msg=err_message)
         return
     if (neighbor and not direction) or (neighbor and 'adv' not in direction.lower()):
-        err_message = 'No support of parsing this command " show ip(v6) bgp neighbor %s %s" yet' % (neighbor, direction)
+        err_message = 'No support of parsing this command " show ip(v6) bgp neighbor %s %s" yet' % (
+            neighbor, direction)
         module.fail_json(msg=err_message)
         return
     try:
         bgproute = BgpRoutes(neighbor, direction, prefix)
 
+        command = "{} 'show version'".format(vtysh_cmd)
+        rc, out, err = module.run_command(command)
+        if rc != 0:
+            err_message = "command %s failed rc=%d, out=%s, err=%s" % (
+                command, rc, out, err)
+            module.fail_json(msg=err_message)
+            return
+        if "FRRouting" in out:
+            is_frr = True
+            use_json = "json"
+
         if prefix:
             if regex_ipv4.match(prefix):
-                command = "docker exec -i bgp vtysh -c 'show ip bgp " + str(prefix) + "'"
+                command = "{} 'show ip bgp {} {}'".format(
+                    vtysh_cmd, str(prefix), use_json
+                )
             else:
-                command = "docker exec -i bgp vtysh -c 'show ipv6 bgp " + str(prefix) +  "'"
+                command = "{} 'show ipv6 bgp {} {}'".format(
+                    vtysh_cmd, str(prefix), use_json
+                )
             rc, out, err = module.run_command(command)
             if rc != 0:
-                err_message = "command %s failed rc=%d, out=%s, err=%s" %(command, rt, out, err)
+                err_message = "command %s failed rc=%d, out=%s, err=%s" % (
+                    command, rc, out, err)
                 module.fail_json(msg=err_message)
                 return
-            bgproute.parse_bgp_route_prefix(out)
+            if is_frr:
+                bgproute.parse_bgp_route_prefix_json(out)
+            else:
+                bgproute.parse_bgp_route_prefix(out)
 
         elif neighbor:
             if netaddr.valid_ipv4(neighbor):
-                command = "docker exec -i bgp vtysh -c 'show ip bgp neighbor " + str(neighbor) + " " + str(direction) + "'"
+                command = "{} 'show ip bgp neighbor {} {} {}'".format(
+                    vtysh_cmd, str(neighbor), str(direction), use_json
+                )
             else:
-                command = "docker exec -i bgp vtysh -c 'show ipv6 bgp neighbor " + str(neighbor) + " " + str(direction) + "'"
+                command = "{} 'show ipv6 bgp neighbor {} {} {}'".format(
+                    vtysh_cmd, str(neighbor), str(direction), use_json
+                )
             rc, out, err = module.run_command(command)
-            if rc !=  0:
-                err_message = "command %s failed rc=%d, out=%s, err=%s" %(command, rt, out, err)
+            if rc != 0:
+                err_message = "command %s failed rc=%d, out=%s, err=%s" % (
+                    command, rc, out, err)
                 module.fail_json(msg=err_message)
                 return
-            bgproute.parse_bgp_route_adv(out)
+            if is_frr:
+                bgproute.parse_bgp_route_adv_json(out)
+            else:
+                bgproute.parse_bgp_route_adv(out)
 
         results = bgproute.get_facts()
         module.exit_json(ansible_facts=results)
@@ -353,8 +439,5 @@ def main():
     return
 
 
-from ansible.module_utils.basic import *
-from collections  import defaultdict
-import netaddr
 if __name__ == "__main__":
     main()

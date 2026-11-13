@@ -1,4 +1,7 @@
 #!/usr/bin/python
+from ansible.module_utils.basic import AnsibleModule
+import re
+import time
 
 DOCUMENTATION = '''
 module:         bgp_facts
@@ -48,42 +51,84 @@ Read thread: off  Write thread: off
 
 class BgpModule(object):
     def __init__(self):
+        self.instances = []
         self.module = AnsibleModule(
             argument_spec=dict(
+                num_npus=dict(type='int', default=1),
+                instance_id=dict(type='int'),
             ),
             supports_check_mode=True)
 
+        m_args = self.module.params
+        if 'instance_id' in m_args and m_args['instance_id'] is not None:
+            self.instances.append("bgp{}".format(m_args['instance_id']))
+        else:
+            npus = m_args['num_npus']
+            if npus > 1:
+                for npu in range(0, npus):
+                    self.instances.append("bgp{}".format(npu))
+            else:
+                self.instances.append("bgp")
+
         self.out = None
         self.facts = {}
-
+        self.facts['bgp_neighbors'] = {}
         return
 
     def run(self):
         """
             Main method of the class
         """
-        self.collect_data('summary')
-        self.parse_summary()
-        self.collect_data('neighbor')
-        self.parse_neighbors()
-        self.get_statistics()
+
+        # Check if bgp is enabled as a feature, and if not return facts with empty bgp_neighbors.
+        rc, self.out, err = self.module.run_command("show feature status bgp", executable='/bin/bash',
+                                                    use_unsafe_shell=True)
+        regex_bgp = re.compile(r'bgp\s+disabled')
+        if regex_bgp.search(self.out):
+            self.module.exit_json(ansible_facts=self.facts)
+
+        for instance in self.instances:
+            self.collect_data('summary', instance)
+            self.parse_summary()
+            self.collect_data('neighbor', instance)
+            self.parse_neighbors()
+            self.get_statistics()
         self.module.exit_json(ansible_facts=self.facts)
 
-    def collect_data(self, command_str):
+    def collect_data(self, command_str, instance):
         """
             Collect bgp information by reading output of 'vtysh' command line tool
         """
-        try:
-            rc, self.out, err = self.module.run_command('docker exec -i bgp vtysh -c "show ip bgp ' + command_str + '"',
-                                                        executable='/bin/bash', use_unsafe_shell=True)
-        except Exception as e:
-            self.module.fail_json(msg=str(e))
+        deadline = time.time() + 120
+        interval = 2
+        last_rc, last_err = None, ''
+        while True:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                break
+            per_call = min(20, max(5, int(remaining)))
+            docker_cmd = 'timeout -k 5 {t} docker exec {inst} vtysh -c "show ip bgp {cmd}" </dev/null'.format(
+                t=per_call, inst=instance, cmd=command_str)
+            try:
+                rc, self.out, err = self.module.run_command(
+                    docker_cmd, executable='/bin/bash', use_unsafe_shell=True)
+            except Exception as e:
+                self.module.fail_json(msg=str(e))
 
-        if rc != 0:
-            self.module.fail_json(msg="Command failed rc=%d, out=%s, err=%s" %
-                                      (rc, self.out, err))
+            if rc == 0:
+                return
+            last_rc, last_err = rc, err
 
-        return
+            sleep_for = min(interval, max(0, deadline - time.time()))
+            if sleep_for <= 0:
+                break
+            time.sleep(sleep_for)
+            interval = min(interval * 2, 10)
+
+        self.module.fail_json(
+            msg="bgp_facts: 'show ip bgp %s' in container '%s' did not succeed within 120s "
+                "(last rc=%s, err=%r); caller should retry" % (
+                    command_str, instance, last_rc, last_err))
 
     def parse_summary(self):
         regex_asn = re.compile(r'.*local AS number (\d+).*')
@@ -91,21 +136,34 @@ class BgpModule(object):
             self.facts['bgp_localasn'] = regex_asn.match(self.out).group(1)
 
     def parse_neighbors(self):
-        regex_ipv4 = re.compile(r'^BGP neighbor is \*?(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})')
+        regex_ipv4 = re.compile(
+            r'^BGP neighbor is \*?(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})')
+        regex_confed_link = re.compile(r'^BGP neighbor is .*(confed-(?:internal|external) link)')
         regex_ipv6 = re.compile(r'^BGP neighbor is \*?([0-9a-fA-F:]+)')
         regex_remote_as = re.compile(r'.*remote AS (\d+)')
         regex_local_as = re.compile(r'.*local AS (\d+)')
         regex_desc = re.compile(r'.*Description: (.*)')
         regex_admin_down = re.compile(r'.*Administratively shut down')
-        regex_routerid = re.compile(r'.*remote router ID (\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})')
+        regex_routerid = re.compile(
+            r'.*remote router ID (\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})')
         regex_state = re.compile(r'.*BGP state = (\w+)')
-        regex_stats = re.compile(r'.*(Opens|Notifications|Updates|Keepalives|Route Refresh|Capability|Total):.*')
-        regex_mrai = re.compile(r'.*Minimum time between advertisement runs is (\d{1,4})')
-        regex_accepted = re.compile(r'.*(\d+) accepted prefixes')
+        regex_stats = re.compile(
+            r'.*(Opens|Notifications|Updates|Keepalives|Route Refresh|Capability|Total):.*')
+        regex_mrai = re.compile(
+            r'.*Minimum time between advertisement runs is (\d{1,4})')
+        regex_accepted = re.compile(r'.*(\d+) accepted')
         regex_conn_est = re.compile(r'.*Connections established (\d+)')
-        regex_conn_dropped = re.compile(r'.*Connections established \d+; dropped (\d+)')
-        regex_peer_group = re.compile(r'.*Member of peer-group (.*) for session parameters')
-        regex_subnet =  re.compile(r'.*subnet range group: (\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\/\d{1,2})')
+        regex_conn_dropped = re.compile(
+            r'.*Connections established \d+; dropped (\d+)')
+        regex_peer_group = re.compile(
+            r'.*Member of peer-group (.*) for session parameters')
+        regex_subnet = re.compile(
+            r'.*subnet range group: (\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\/\d{1,2})')
+        regex_cap_gr = re.compile(r'.*Graceful Restart Capabilty: (\w+)')
+        regex_cap_gr_peer_restart_time = re.compile(
+            r'.*Remote Restart timer is (\d+)')
+        regex_cap_gr_peer_af_ip4 = re.compile(r'.*IPv4 Unicast\((.*)\)')
+        regex_cap_gr_peer_af_ip6 = re.compile(r'.*IPv6 Unicast\((.*)\)')
 
         neighbors = {}
 
@@ -117,31 +175,74 @@ class BgpModule(object):
                 # ignore empty rows
                 if 'BGP' in n:
                     neighbor = {}
+                    capabilities = {}
                     message_stats = {}
                     n = "BGP neighbor is" + n
                     lines = n.splitlines()
                     neighbor['admin'] = 'up'
                     neighbor['accepted prefixes'] = 0
+                    neighbor_ip = None
 
                     for line in lines:
+                        if regex_confed_link.match(line):
+                            neighbor['confed_peer'] = True
+                            confed_peer_type = regex_confed_link.match(line).group(1)
+                            neighbor['confed_peer_type'] = 'external' if confed_peer_type == 'confed-external link' else 'internal'  # noqa: E501
                         if regex_ipv4.match(line):
                             neighbor_ip = regex_ipv4.match(line).group(1)
                             neighbor['ip_version'] = 4
                         elif regex_ipv6.match(line):
-                            neighbor_ip = regex_ipv6.match(line).group(1).lower()
+                            neighbor_ip = regex_ipv6.match(
+                                line).group(1).lower()
                             neighbor['ip_version'] = 6
-                        if regex_remote_as.match(line): neighbor['remote AS'] = int(regex_remote_as.match(line).group(1))
-                        if regex_local_as.match(line): neighbor['local AS'] = int(regex_local_as.match(line).group(1))
-                        if regex_desc.match(line): neighbor['description'] = regex_desc.match(line).group(1)
-                        if regex_admin_down.match(line): neighbor['admin'] = 'down'
-                        if regex_routerid.match(line): neighbor['remote routerid'] = regex_routerid.match(line).group(1)
-                        if regex_state.match(line): neighbor['state'] = regex_state.match(line).group(1).lower()
-                        if regex_mrai.match(line): neighbor['mrai'] = int(regex_mrai.match(line).group(1))
-                        if regex_accepted.match(line): neighbor['accepted prefixes'] += int(regex_accepted.match(line).group(1))
-                        if regex_conn_est.match(line): neighbor['connections established'] = int(regex_conn_est.match(line).group(1))
-                        if regex_conn_dropped.match(line): neighbor['connections dropped'] = int(regex_conn_dropped.match(line).group(1))
-                        if regex_peer_group.match(line): neighbor['peer group'] = regex_peer_group.match(line).group(1)
-                        if regex_subnet.match(line): neighbor['subnet'] = regex_subnet.match(line).group(1)
+                        if regex_remote_as.match(line):
+                            neighbor['remote AS'] = int(
+                                regex_remote_as.match(line).group(1))
+                        if regex_local_as.match(line):
+                            neighbor['local AS'] = int(
+                                regex_local_as.match(line).group(1))
+                        if regex_desc.match(line):
+                            neighbor['description'] = regex_desc.match(
+                                line).group(1)
+                        if regex_admin_down.match(line):
+                            neighbor['admin'] = 'down'
+                        if regex_routerid.match(line):
+                            neighbor['remote routerid'] = regex_routerid.match(
+                                line).group(1)
+                        if regex_state.match(line):
+                            neighbor['state'] = regex_state.match(
+                                line).group(1).lower()
+                        if regex_mrai.match(line):
+                            neighbor['mrai'] = int(
+                                regex_mrai.match(line).group(1))
+                        if regex_accepted.match(line):
+                            neighbor['accepted prefixes'] += int(
+                                regex_accepted.match(line).group(1))
+                        if regex_conn_est.match(line):
+                            neighbor['connections established'] = int(
+                                regex_conn_est.match(line).group(1))
+                        if regex_conn_dropped.match(line):
+                            neighbor['connections dropped'] = int(
+                                regex_conn_dropped.match(line).group(1))
+                        if regex_peer_group.match(line):
+                            neighbor['peer group'] = regex_peer_group.match(
+                                line).group(1)
+                        if regex_subnet.match(line):
+                            neighbor['subnet'] = regex_subnet.match(
+                                line).group(1)
+
+                        if regex_cap_gr.match(line):
+                            capabilities['graceful restart'] = regex_cap_gr.match(
+                                line).group(1).lower()
+                        if regex_cap_gr_peer_restart_time.match(line):
+                            capabilities['peer restart timer'] = int(
+                                regex_cap_gr_peer_restart_time.match(line).group(1))
+                        if regex_cap_gr_peer_af_ip4.match(line):
+                            capabilities['peer af ipv4 unicast'] = regex_cap_gr_peer_af_ip4.match(
+                                line).group(1).lower()
+                        if regex_cap_gr_peer_af_ip6.match(line):
+                            capabilities['peer af ipv6 unicast'] = regex_cap_gr_peer_af_ip6.match(
+                                line).group(1).lower()
 
                         if regex_stats.match(line):
                             try:
@@ -152,18 +253,24 @@ class BgpModule(object):
                                 value_dict['sent'] = int(sent)
                                 value_dict['rcvd'] = int(rcvd)
                                 message_stats[key] = value_dict
-                            except Exception as e:
-                                print"NonFatal: line:'{}' should not have matched for sent/rcvd count".format(line)
+                            except Exception:
+                                print(
+                                    "NonFatal: line:'{}' should not have matched for sent/rcvd count".format(line))
+
+                        if capabilities:
+                            neighbor['capabilities'] = capabilities
 
                         if message_stats:
                             neighbor['message statistics'] = message_stats
 
-                    neighbors[neighbor_ip] = neighbor
+                    if neighbor_ip:
+                        neighbor.setdefault('peer group', '')
+                        neighbors[neighbor_ip] = neighbor
 
         except Exception as e:
             self.module.fail_json(msg=str(e))
 
-        self.facts['bgp_neighbors'] = neighbors
+        self.facts['bgp_neighbors'].update(neighbors)
         return
 
     def get_statistics(self):
@@ -175,7 +282,7 @@ class BgpModule(object):
         statistics['ipv6_admin_down'] = 0
         statistics['ipv6_idle'] = 0
 
-        for neighbor in self.facts['bgp_neighbors'].itervalues():
+        for neighbor in self.facts['bgp_neighbors'].values():
             if neighbor['ip_version'] == 4:
                 statistics['ipv4'] += 1
                 if neighbor['admin'] == 'down':
@@ -193,6 +300,7 @@ class BgpModule(object):
 
         return
 
+
 def main():
     bgp = BgpModule()
     bgp.run()
@@ -200,6 +308,5 @@ def main():
     return
 
 
-from ansible.module_utils.basic import *
 if __name__ == "__main__":
     main()

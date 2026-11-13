@@ -15,14 +15,14 @@
     seconds: 10
 
 - name: Look for syncd process
-  shell: pgrep "\<syncd\>" -a
+  shell: pgrep syncd -a -x
   register: syncd_out
   ignore_errors: yes
 
 - debug: msg="{{ syncd_out.stdout_lines }}"
 
 - fail: msg="Syncd is still running?"
-  when: 
+  when:
     - ({{ syncd_out.stdout_lines | length }} > 0)
 
 - name: look for core files under /var/core
@@ -35,7 +35,7 @@
 - debug: msg="{{ core_files_after.matched }} - {{ core_files_after.files }}"
 
 - fail: msg="Found new core(s) under /var/core/"
-  when: 
+  when:
     - ({{ core_files_after.files|length > core_files_before.files|length }})
 
 - name: Restart swss service
@@ -49,12 +49,12 @@
     seconds: 120
 
 - name: check basic sanity of the device
-  include: base_sanity.yml
+  include_tasks: base_sanity.yml
   vars:
      recover: false
 
 - name: validate all interfaces are up
-  include: interface.yml
+  include_tasks: interface.yml
   vars:
      recover: false
 

@@ -1,134 +1,117 @@
 import binascii
-import socket
-import struct
-import select
 import json
 import argparse
 import os.path
-from fcntl import ioctl
-from pprint import pprint
+from collections import defaultdict
+import logging
+import scapy.all as scapy
+import ipaddress
+scapy.MTU = 1280
+scapy.conf.use_pcap = True
+# Callers: Expect to wait 10-15 seconds here, as scapy reinitializes everything to use libpcap
+logging.getLogger("scapy.runtime").setLevel(logging.ERROR)
 
 
-def hexdump(data):
-    print " ".join("%02x" % ord(d) for d in data)
-
-def get_if(iff, cmd):
-    s = socket.socket()
-    ifreq = ioctl(s, cmd, struct.pack("16s16x",iff))
-    s.close()
-
-    return ifreq
-
-def get_mac(iff):
-    SIOCGIFHWADDR = 0x8927          # Get hardware address
-    return get_if(iff, SIOCGIFHWADDR)[18:24]
-
-
-class Interface(object):
-    ETH_P_ALL = 0x03
-    RCV_TIMEOUT = 1000
-    RCV_SIZE = 4096
-
-    def __init__(self, iface):
-        self.iface = iface
-        self.socket = None
-        self.mac_address = get_mac(iface)
-
-    def __del__(self):
-        if self.socket:
-            self.socket.close()
-
-    def bind(self):
-        self.socket = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(self.ETH_P_ALL))
-        self.socket.bind((self.iface, 0))
-        self.socket.settimeout(self.RCV_TIMEOUT)
-
-    def handler(self):
-        return self.socket.fileno()
-
-    def recv(self):
-        return self.socket.recv(self.RCV_SIZE)
-
-    def send(self, data):
-        self.socket.send(data)
-
-    def mac(self):
-        return self.mac_address
-
-    def name(self):
-        return self.iface
-
-
-class Poller(object):
-    def __init__(self, interfaces, responder):
-        self.responder = responder
-        self.mapping = {}
-        for interface in interfaces:
-            self.mapping[interface.handler()] = interface 
-
-    def poll(self):
-        handlers = self.mapping.keys()
-        while True:
-            (rdlist, _, _) = select.select(handlers, [], [])
-            for handler in rdlist:
-                self.responder.action(self.mapping[handler])
+# Canonical default config path for the arp_responder helper. Kept in lock-step
+# with tests.common.helpers.constants.ARP_RESPONDER_DEFAULT_CONFIG; we don't
+# import that here because this script is distributed to and executed inside
+# the PTF container, where the sonic-mgmt test tree is not on sys.path.
+DEFAULT_CONFIG_PATH = '/tmp/from_t1.json'
 
 
 class ARPResponder(object):
-    ARP_PKT_LEN = 60
-    def __init__(self, ip_sets):
-        self.arp_chunk = binascii.unhexlify('08060001080006040002') # defines a part of the packet for ARP Reply
-        self.arp_pad = binascii.unhexlify('00' * 18)
+    ARP_OP_REQUEST = 1
+    ip_sets = {}
+    sockets = {}
 
-        self.ip_sets = ip_sets
-
-        return
-
-    def action(self, interface):
-        data = interface.recv()
-        if len(data) >= self.ARP_PKT_LEN:
-            return
-
-        remote_mac, remote_ip, request_ip = self.extract_arp_info(data)
-
-        request_ip_str = socket.inet_ntoa(request_ip)
-        if request_ip_str not in self.ip_sets[interface.name()]:
-            return
-
-        if 'vlan' in self.ip_sets[interface.name()]:
-            vlan_id = self.ip_sets[interface.name()]['vlan']
+    @staticmethod
+    def action(packet):
+        if "ARP" in packet:  # IPv4
+            return ARPResponder.reply_to_arp(packet)
+        elif "ICMPv6ND_NS" in packet and "ICMPv6NDOptSrcLLAddr" in packet:  # IPv6
+            return ARPResponder.reply_to_ndp(packet)
         else:
-            vlan_id = None
+            # Handle other Ethernet types
+            pass
 
-        arp_reply = self.generate_arp_reply(self.ip_sets[interface.name()][request_ip_str], remote_mac, request_ip, remote_ip, vlan_id)
-        interface.send(arp_reply)
+    @staticmethod
+    def reply_to_arp(data):
+        remote_mac = data["ARP"].hwsrc
+        remote_ip = data["ARP"].psrc
+        request_ip = data["ARP"].pdst
+        op_type = data["ARP"].op
 
-        return
-        
-    def extract_arp_info(self, data):
-        return data[6:12], data[28:32], data[38:42] # remote_mac, remote_ip, request_ip
+        # Don't send ARP response if the ARP op code is not request
+        if op_type != ARPResponder.ARP_OP_REQUEST:
+            return
 
-    def generate_arp_reply(self, local_mac, remote_mac, local_ip, remote_ip, vlan_id):
-        eth_hdr = remote_mac + local_mac
-        if vlan_id is not None:
-            eth_type = binascii.unhexlify('8100')
-            eth_hdr += eth_type + vlan_id
+        interface = data.sniffed_on
+        if interface not in ARPResponder.ip_sets:
+            return
+        if request_ip not in ARPResponder.ip_sets[interface]:
+            return
 
-        return eth_hdr + self.arp_chunk + local_mac + local_ip + remote_mac + remote_ip + self.arp_pad
+        if 'vlan' in ARPResponder.ip_sets[interface]:
+            vlan_list = ARPResponder.ip_sets[interface]['vlan']
+        else:
+            vlan_list = [None]
+
+        for vlan_id in vlan_list:
+            arp_reply = ARPResponder.generate_arp_reply(ARPResponder.ip_sets[interface][request_ip],
+                                                        remote_mac, request_ip, remote_ip, vlan_id)
+            scapy.sendp(arp_reply, socket=ARPResponder.sockets[interface])
+
+    @staticmethod
+    def reply_to_ndp(data):
+        remote_mac = data["ICMPv6NDOptSrcLLAddr"].lladdr
+        remote_ip = data["IPv6"].src
+        request_ip = data["ICMPv6ND_NS"].tgt
+
+        interface = data.sniffed_on
+        if interface not in ARPResponder.ip_sets:
+            return
+        if request_ip not in ARPResponder.ip_sets[interface]:
+            return
+
+        ndp_reply = ARPResponder.generate_neigh_adv(ARPResponder.ip_sets[interface][request_ip],
+                                                    remote_mac, request_ip, remote_ip)
+        scapy.sendp(ndp_reply, socket=ARPResponder.sockets[interface])
+
+    @staticmethod
+    def generate_arp_reply(local_mac, remote_mac, local_ip, remote_ip, vlan_id):
+        l2 = scapy.Ether(dst=remote_mac, src=local_mac, type=(0x8100 if vlan_id else 0x0806))
+        l3 = scapy.ARP(op=2, hwsrc=local_mac, psrc=local_ip, hwdst=remote_mac, pdst=remote_ip)
+        if vlan_id:
+            l2 /= scapy.Dot1Q(vlan=vlan_id, type=0x0806)
+
+        return l2 / l3
+
+    @staticmethod
+    def generate_neigh_adv(local_mac, remote_mac, target_ip, remote_ip):
+        neigh_adv_pkt = scapy.Ether(src=local_mac, dst=remote_mac)
+        neigh_adv_pkt /= scapy.IPv6(src=target_ip, dst=remote_ip)
+        neigh_adv_pkt /= scapy.ICMPv6ND_NA(tgt=target_ip, R=0, S=1, O=1)
+        neigh_adv_pkt /= scapy.ICMPv6NDOptDstLLAddr(lladdr=local_mac)
+
+        return neigh_adv_pkt
+
 
 def parse_args():
     parser = argparse.ArgumentParser(description='ARP autoresponder')
-    parser.add_argument('--conf', '-c', type=str, dest='conf', default='/tmp/from_t1.json', help='path to json file with configuration')
-    parser.add_argument('--extended', '-e', action='store_true', dest='extended', default=False, help='enable extended mode')
+    parser.add_argument('--conf', '-c', type=str, dest='conf',
+                        default=DEFAULT_CONFIG_PATH, help='path to json file with configuration')
+    parser.add_argument('--extended', '-e', action='store_true',
+                        dest='extended', default=False, help='enable extended mode')
     args = parser.parse_args()
 
     return args
+
 
 def main():
     args = parse_args()
 
     if not os.path.exists(args.conf):
-        print "Can't find file %s" % args.conf
+        print(("Can't find file %s" % args.conf))
         return
 
     with open(args.conf) as fp:
@@ -136,36 +119,58 @@ def main():
 
     # generate ip_sets. every ip address will have it's own uniq mac address
     ip_sets = {}
-    counter = 0
-    for iface, ip_dict in data.items():
+    sockets = {}
+    inverse_sockets = {}
+    for iface, ip_dict in list(data.items()):
         vlan = None
+        iface = str(iface)
         if iface.find('@') != -1:
             iface, vlan = iface.split('@')
-            vlan_tag = format(int(vlan), 'x')
-            vlan_tag = vlan_tag.zfill(4)
-        ip_sets[str(iface)] = {}
+            vlan_tag = int(vlan)
+        if iface not in ip_sets:
+            ip_sets[iface] = defaultdict(list)
         if args.extended:
-            for ip, mac in ip_dict.items():
-                ip_sets[str(iface)][str(ip)] = binascii.unhexlify(str(mac))
-                counter += 1
+            for ip, mac in list(ip_dict.items()):
+                ip_sets[iface][str(ip)] = binascii.unhexlify(str(mac))
         else:
             for ip in ip_dict:
-                ip_sets[str(iface)][str(ip)] = get_mac(str(iface))
+                ip_sets[iface][str(ip)] = scapy.get_if_hwaddr(iface)
         if vlan is not None:
-            ip_sets[str(iface)]['vlan'] = binascii.unhexlify(vlan_tag)
+            ip_sets[iface]['vlan'].append(vlan_tag)
 
-    ifaces = []
-    for iface_name in ip_sets.keys():
-        iface = Interface(iface_name)
-        iface.bind()
-        ifaces.append(iface)
+    for iface in ip_sets:
+        arp_filter_entries = []
+        icmp_filter_entries = []
+        for ip in ip_sets[iface]:
+            if ip == 'vlan':
+                continue
+            ip_address = ipaddress.ip_address(ip)
+            if ip_address.version == 4:
+                arp_filter_entries.append(f'arp[24:4] = 0x{int.from_bytes(ip_address.packed, "big"):0x}')  # noqa: E231
+            else:
+                ipv6_address_integer = int.from_bytes(ip_address.packed, "big")
+                # libpcap on Buster doesn't support looking into ICMPv6 header directly, so look from the IPv6 header
+                # instead. When the PTF container is upgraded to Bullseye or newer, then the commented filter syntax
+                # below can be used instead.
+                #
+                # icmp_filter_entries.append(f'icmp6[20:4] = 0x{ipv6_address_integer & 0xffffffff:0x}')  # noqa: E231
+                icmp_filter_entries.append(f'ip6[60:4] = 0x{ipv6_address_integer & 0xffffffff:0x}')  # noqa: E231
+        if len(arp_filter_entries) > 0 and len(icmp_filter_entries) > 0:
+            pcap_filter = f"(arp and ({' or '.join(arp_filter_entries)})) or " + \
+                f"(icmp6 and ({' or '.join(icmp_filter_entries)}))"
+        elif len(arp_filter_entries) > 0:
+            pcap_filter = f"arp and ({' or '.join(arp_filter_entries)})"
+        elif len(icmp_filter_entries) > 0:
+            pcap_filter = f"icmp6 and ({' or '.join(icmp_filter_entries)})"
 
-    resp = ARPResponder(ip_sets)
+        sockets[iface] = scapy.conf.L2socket(iface=iface, filter=pcap_filter)
+        inverse_sockets[sockets[iface]] = iface
 
-    p = Poller(ifaces, resp)
-    p.poll()
+    ARPResponder.ip_sets = ip_sets
+    ARPResponder.sockets = sockets
 
-    return
+    scapy.sniff(prn=ARPResponder.action, opened_socket=inverse_sockets, store=False)
+
 
 if __name__ == '__main__':
     main()

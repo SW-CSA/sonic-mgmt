@@ -1,10 +1,12 @@
 '''
 Description:    This file contains the Everflow test for SONiC testbed
 
-                Implemented according to the https://github.com/Azure/SONiC/wiki/Everflow-test-plan
+                Implemented according to the https://github.com/sonic-net/SONiC/wiki/Everflow-test-plan
 
 Usage:          Examples of how to use:
-                ptf --test-dir acstests everflow_tb_test.EverflowTest --platform remote -t 'router_mac="00:02:03:04:05:00";src_port="20";dst_ports="21,22";session_src_ip="1.1.1.1";session_dst_ip="2.2.2.2";session_ttl="64";session_dscp="0";verbose=True'
+                ptf --test-dir acstests everflow_tb_test.EverflowTest --platform remote \
+                -t 'router_mac="00:02:03:04:05:00";src_port="20";dst_ports="21,22";session_src_ip="1.1.1.1";\
+                session_dst_ip="2.2.2.2";session_ttl="64";session_dscp="0";verbose=True'
 '''
 
 
@@ -15,6 +17,7 @@ import ptf.testutils as testutils
 from ptf.base_tests import BaseTest
 from ptf.mask import Mask
 
+
 def reportResults(test_name):
     '''
     @summary Report test result
@@ -22,7 +25,7 @@ def reportResults(test_name):
     def testDecorator(func):
         def wrapper(*args, **kwargs):
             res = func(*args, **kwargs)
-            print 'Test "%s" %s' % (test_name, "PASSED" if res else "FAILED")
+            print('Test "%s" %s' % (test_name, "PASSED" if res else "FAILED"))
             return res
         return wrapper
     return testDecorator
@@ -34,8 +37,7 @@ class EverflowTest(BaseTest):
     '''
 
     GRE_PROTOCOL_NUMBER = 47
-    PORT_COUNT = 31 # temporary exclude the last port
-
+    PORT_COUNT = 31     # temporary exclude the last port
 
     def __init__(self):
         '''
@@ -43,7 +45,6 @@ class EverflowTest(BaseTest):
         '''
         BaseTest.__init__(self)
         self.test_params = testutils.test_params_get()
-
 
     def gre_type_filter(self, pkt_str):
         '''
@@ -56,9 +57,8 @@ class EverflowTest(BaseTest):
                 return False
 
             return pkt[scapy.IP].proto == self.GRE_PROTOCOL_NUMBER
-        except:
+        except Exception:
             return False
-
 
     def setUp(self):
         '''
@@ -76,20 +76,21 @@ class EverflowTest(BaseTest):
         self.src_port = int(float(self.test_params['src_port']))
         self.dst_ports = [int(float(p)) for p in self.test_params['dst_ports'].split(",") if p]
         self.expected_dst_mac = self.test_params.get('expected_dst_mac', None)
+        self.expect_received = self.test_params.get('expect_received', True)
+        self.acl_stage = self.test_params.get('acl_stage', 'ingress')
+        self.mirror_stage = self.test_params.get('mirror_stage', 'ingress')
 
         testutils.add_filter(self.gre_type_filter)
 
         self.tests_total = 0
-        self.base_pkt = testutils.simple_tcp_packet(
-                eth_dst = self.router_mac,
-                eth_src = self.dataplane.get_mac(0, 0),
-                ip_src = "20.0.0.1",
-                ip_dst = "30.0.0.1",
-                tcp_sport = 0x1234,
-                tcp_dport = 0x50,
-                ip_ttl = 64
-                )
-
+        self.base_pkt = testutils.simple_tcp_packet(eth_dst=self.router_mac,
+                                                    eth_src=self.dataplane.get_mac(0, 0),
+                                                    ip_src="20.0.0.1",
+                                                    ip_dst="30.0.0.1",
+                                                    tcp_sport=0x1234,
+                                                    tcp_dport=0x50,
+                                                    ip_ttl=64
+                                                    )
 
     def receivePacketOnPorts(self, ports=[], device_number=0):
         '''
@@ -105,8 +106,7 @@ class EverflowTest(BaseTest):
 
         return (match_index, rcv_pkt, received)
 
-
-    def runSendReceiveTest(self, pkt2send, src_port, destination_ports):
+    def sendReceive(self, pkt2send, src_port, destination_ports):
         """
         @summary Send packet and verify it is received/not received on the expected ports
         """
@@ -137,7 +137,7 @@ class EverflowTest(BaseTest):
             return False
 
         # TODO: Fanout modifies DSCP. TOS value is olways 0.
-        #if (scapy_pkt[scapy.IP].tos >> 2) != self.session_dscp:
+        # if (scapy_pkt[scapy.IP].tos >> 2) != self.session_dscp:
         #    return False
 
         payload = str(scapy_pkt[scapy.GRE].payload)
@@ -146,10 +146,17 @@ class EverflowTest(BaseTest):
             payload = str(scapy_pkt[scapy.GRE].payload)[22:]
         if self.asic_type in ["barefoot"]:
             payload = str(scapy_pkt[scapy.GRE].payload)[12:]
+        if self.asic_type in ["marvell-teralynx"]:
+            payload = str(scapy_pkt[scapy.GRE].payload)[8:]
 
         inner_pkt = scapy.Ether(payload)
 
+        if self.mirror_stage == 'egress':
+            pkt2send['IP'].ttl -= 1  # expect mirrored packet on egress has TTL decremented
+
         masked_inner_pkt = Mask(inner_pkt)
+        masked_inner_pkt.set_do_not_care_scapy(scapy.Ether, "dst")
+        masked_inner_pkt.set_do_not_care_scapy(scapy.Ether, "src")
         if scapy.IP in inner_pkt:
             masked_inner_pkt.set_do_not_care_scapy(scapy.IP, "chksum")
 
@@ -158,6 +165,11 @@ class EverflowTest(BaseTest):
 
         return dataplane.match_exp_pkt(masked_inner_pkt, pkt2send)
 
+    def runSendReceiveTest(self, pkt, src_port, dst_ports):
+        if self.expect_received:
+            return self.sendReceive(pkt, src_port, dst_ports)
+        else:
+            return not self.sendReceive(pkt, src_port, dst_ports)
 
     @reportResults("Verify SRC IP match")
     def verifySrcIp(self):
@@ -165,13 +177,11 @@ class EverflowTest(BaseTest):
         pkt['IP'].src = "20.0.0.10"
         return self.runSendReceiveTest(pkt, self.src_port, self.dst_ports)
 
-
     @reportResults("Verify DST IP match")
     def verifyDstIp(self):
         pkt = self.base_pkt.copy()
         pkt['IP'].dst = "30.0.0.10"
         return self.runSendReceiveTest(pkt, self.src_port, self.dst_ports)
-
 
     @reportResults("Verify L4 SRC port match")
     def verifyL4SrcPort(self):
@@ -179,13 +189,11 @@ class EverflowTest(BaseTest):
         pkt['TCP'].sport = 0x1235
         return self.runSendReceiveTest(pkt, self.src_port, self.dst_ports)
 
-
     @reportResults("Verify L4 DST port match")
     def verifyL4DstPort(self):
         pkt = self.base_pkt.copy()
         pkt['TCP'].dport = 0x1235
         return self.runSendReceiveTest(pkt, self.src_port, self.dst_ports)
-
 
     @reportResults("Verify IP protocol match")
     def verifyIpProtocol(self):
@@ -193,13 +201,11 @@ class EverflowTest(BaseTest):
         pkt['IP'].proto = 0x7E
         return self.runSendReceiveTest(pkt, self.src_port, self.dst_ports)
 
-
     @reportResults("Verify TCP flags match")
     def verifyTcpFlags(self):
         pkt = self.base_pkt.copy()
         pkt['TCP'].flags = 0x12
         return self.runSendReceiveTest(pkt, self.src_port, self.dst_ports)
-
 
     @reportResults("Verify L4 SRC port range match")
     def verifyL4SrcPortRange(self):
@@ -207,20 +213,17 @@ class EverflowTest(BaseTest):
         pkt['TCP'].sport = 4675
         return self.runSendReceiveTest(pkt, self.src_port, self.dst_ports)
 
-
     @reportResults("Verify L4 DST port range match")
     def verifyL4DstPortRange(self):
         pkt = self.base_pkt.copy()
         pkt['TCP'].dport = 4675
         return self.runSendReceiveTest(pkt, self.src_port, self.dst_ports)
 
-
     @reportResults("Verify IP DSCP match")
     def verifyIpDscp(self):
         pkt = self.base_pkt.copy()
         pkt['IP'].tos = 51 << 2
         return self.runSendReceiveTest(pkt, self.src_port, self.dst_ports)
-
 
     def runEverflowTests(self):
         """
@@ -260,12 +263,11 @@ class EverflowTest(BaseTest):
 
         return tests_passed, self.tests_total
 
-
     def runTest(self):
         """
         @summary: Run Everflow tests
         """
         (tests_passed, tests_total) = self.runEverflowTests()
-        print "Passed %d test of %d" % (tests_passed, tests_total)
+        print("Passed %d test of %d" % (tests_passed, tests_total))
 
-        assert(tests_passed == tests_total)
+        assert (tests_passed == tests_total)

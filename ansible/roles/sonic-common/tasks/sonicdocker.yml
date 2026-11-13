@@ -96,11 +96,11 @@
 - block:
   ## Clean up images before pulling
   - name: "{{docker_container}} - Clean up images before pulling"
-    include: sonicdocker_clean.yml
+    include_tasks: sonicdocker_clean.yml
 
   ## Pull docker image from registry
   - name: "{{docker_container}} - Pull docker image from registry"
-    shell: docker login -u {{docker_registry_username}} -p {{docker_registry_password}} -e "@" {{docker_registry_host}}; docker pull {{docker_registry_host}}/{{docker_image}}
+    shell: docker pull {{docker_registry_host}}/{{docker_image}}
     register: pull_result
     changed_when: "'Status: Downloaded newer image' in pull_result.stdout"
   when: docker_state == 'reloaded'
@@ -139,8 +139,6 @@
     tty: "{{docker_tty}}"
     stdin_open: yes
     registry: "https://{{docker_registry_host}}"
-    username: "{{docker_registry_username}}"
-    password: "{{docker_registry_password}}"
     email: "@"
     volumes: "{{docker_volumes}}"
     volumes_from: "{{docker_volumes_from}}"
@@ -177,7 +175,7 @@
 
 ## Clean up images after pulled and running
 - name: "{{docker_container}} - Clean up images after pulled and running"
-  include: sonicdocker_clean.yml
+  include_tasks: sonicdocker_clean.yml
   when: "(docker_state == 'reloaded' and 'Status: Downloaded newer image' in pull_result.stdout) or  \
         docker_state == 'absent'"
 

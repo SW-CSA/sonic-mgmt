@@ -1,24 +1,61 @@
-#!/usr/bin/env python
+#!/usr/bin/python
 
-import lxml.etree as ET
+from ansible.module_utils.basic import AnsibleModule
 import yaml
 import os
+import logging
 import traceback
-import ipaddr as ipaddress
-from operator import itemgetter
-from itertools import groupby
-from collections import defaultdict
 
-DOCUMENTATION='''
+try:
+    from ansible.module_utils.debug_utils import config_module_logging
+    from ansible.module_utils.graph_utils import LabGraph
+except ImportError:
+    # Add parent dir for using outside Ansible
+    import sys
+    sys.path.append('..')
+    from module_utils.debug_utils import config_module_logging
+    from module_utils.graph_utils import LabGraph
+
+config_module_logging('conn_graph_facts')
+
+
+DOCUMENTATION = '''
 module: conn_graph_facts.py
-version_added:  2.0
-short_description: Retrive lab fanout switches physical and vlan connections
+short_description: Retrieve lab devices and physical connections information.
 Description:
-    Retrive lab fanout switches physical and vlan connections
-    add to Ansible facts
+    Retrieve lab devices information and the physical connections between the devices.
 options:
-    host:  [fanout switch name|Server name|Sonic Switch Name]
-    requred: True
+    host:
+        [fanout switch name|Server name|Sonic Switch Name]
+        required: False
+    hosts:
+        List of hosts. Applicable for multi-DUT and single-DUT setup. The host option for single DUT setup is kept
+        for backward compatibility.
+        required: False
+    anchor:
+        List of hosts. When no host and hosts is provided, the anchor option must be specified with list of hosts.
+        This option is to supply the relevant list of hosts for looking up the connection graph xml file which has
+        all the supplied hosts. The whole graph will be returned when this option is used. This is for configuring
+        the root fanout switch.
+        required: False
+    filepath:
+        Folder of the csv graph files.
+
+    group:
+        The csv files are organized in multiple groups. Each group has a set of csv files describing the connections
+        and devices connected to a same root fanout switch. Usually devices within a same group are also tracked
+        in a dedicated inventory file under the `ansible` folder.
+        When the group file is not supplied, this module will try to find the group based on the supplied
+        host/hosts/anchor information.
+        required: False
+
+    forced_mgmt_routes:
+        List of forced management routes (IPv4/IPv6). Will be parsed into
+        forced_mgmt_routes_v4 and forced_mgmt_routes_v6 and added to each
+        device entry in graph facts.
+        required: False
+
+    Mutually exclusive options: host, hosts, anchor
 
 Ansible_facts:
     device_info: The device(host) type and hwsku
@@ -26,10 +63,20 @@ Ansible_facts:
     device_vlan_range: all configured vlan range for the device(host)
     device_port_vlans: detailed vlanids for each physical port and switchport mode
     server_links: each server port vlan ids
+    device_console_info: The device's console server type, mgmtip, hwsku and protocol
+    device_console_link:  The console server port connected to the device
+    device_bmc_info: The device's bmc server type, mgmtip, hwsku and protocol
+    device_bmc_link:  The bmc server port connected to the device
+    device_pdu_info: A dict of pdu device's pdu type, mgmtip, hwsku and protocol
+    device_pdu_links: The pdu server ports connected to the device and pdu info
+    device_from_l1_links: The L1 switch ports connected to the filtered devices.
+    device_to_l1_links: The switch ports connected to the L1 switches.
+    device_l1_cross_connects: The cross connect ports in L1 switches.
 
 '''
 
-EXAMPLES='''
+
+EXAMPLES = '''
     - name: conn_graph_facts: host = "str-7260-11"
 
     return:
@@ -38,18 +85,15 @@ EXAMPLES='''
               "HwSku": "Arista-7260QX-64",
               "Type": "FanoutLeaf"
             },
-          "device_conn": [
-          {
-             "StartPort": "Ethernet0",
-             "EndPort": "Ethernet33",
-             "StartDevice": "str-s6000-on-1",
-             "VlanID": "233",
-             "BandWidth": "40000",
-             "VlanMode": "Access",
-             "EndDevice": "str-7260-01"
-           },
-           {...}
-           ],
+          "device_conn": {
+              "str-7260-11": {
+                  "Ethernet0": {
+                      "peerdevice": "str-7050qx-2",
+                      "peerport": "Ethernet4",
+                      "speed": "40000"
+                  },
+              }
+          },
            "device_vlan_range": {
               "VlanRange": "201-980,1041-1100"
             },
@@ -65,206 +109,129 @@ EXAMPLES='''
                },......
             }
 
-
 '''
 
-LAB_CONNECTION_GRAPH_FILE = 'lab_connection_graph.xml'
-LAB_GRAPHFILE_PATH = 'files/'
 
-class Parse_Lab_Graph():
+LAB_GRAPHFILE_PATH = "files/"
+LAB_GRAPH_GROUPS_FILE = "graph_groups.yml"
+
+
+def find_graph(hostnames, part=False, forced_mgmt_routes=None):
+    """Find the graph file for the target device
+
+    Args:
+        hostnames (list): List of hostnames
+        part (bool, optional): Select the graph file if over 80% of hosts are found in conn_graph when part is True.
+                               Defaults to False.
+
+    Returns:
+        obj: Instance of LabGraph or None if no graph file is found.
     """
-    Parse the generated lab physical connection graph and insert Ansible fact of the graph
-    for deploying fanout switches and dynamically configure vlan mapping to hook up EOS VMs
-    and ptf docker for lab testing
+    graph_group_file = os.path.join(LAB_GRAPHFILE_PATH, LAB_GRAPH_GROUPS_FILE)
+    with open(graph_group_file) as fd:
+        graph_groups = yaml.safe_load(fd)
 
-    There is a creategraph.py under ansible/files to create the png and dpg like graph file for lab devices from csv file
-    The  2 csv files under ansible/files are csv files to list all devices and device links for Sonic testbed
-    There is a sonic_server_links.yml file to describe the connections between servers port and Sonic devices
-    This module conn_graph_file also parse the server links to have a full root fanout switches template for deployment.
-    """
+    target_graph = None
+    target_group = None
+    for group in graph_groups:
+        logging.debug("Looking at graph files of group {} for hosts {}".format(group, hostnames))
+        lab_graph = LabGraph(LAB_GRAPHFILE_PATH, group, forced_mgmt_routes=forced_mgmt_routes)
+        graph_hostnames = set(lab_graph.graph_facts["devices"].keys())
+        logging.debug("For graph group {}, got hostnames {}".format(group, graph_hostnames))
 
-    def __init__(self, xmlfile):
-        self.root = ET.parse(xmlfile)
-        self.devices = {}
-        self.vlanport = {}
-        self.vlanrange = {}
-        self.links = {}
-        self.server = defaultdict(dict)
-        self.pngtag = 'PhysicalNetworkGraphDeclaration'
-        self.dpgtag = 'DataPlaneGraph'
-
-    def port_vlanlist(self, vlanrange):
-        vlans = []
-        for vlanid in list(map(str.strip,vlanrange.split(','))):
-            if vlanid.isdigit():
-                vlans.append(int(vlanid))
-                continue
-            elif '-' in vlanid:
-                vlanlist = list(map(str.strip,vlanid.split('-')))
-                vlans.extend(range(int(vlanlist[0]), int(vlanlist[1])+1))
-                continue
-            elif vlanid != '':
-                raise Exception, 'vlan range error "%s"'%vlanrange
-        vlans = sorted(set(vlans))
-        return vlans
-
-    def parse_graph(self):
-        """
-        Parse  the xml graph file
-        """
-        deviceinfo = {}
-        deviceroot = self.root.find(self.pngtag).find('Devices')
-        devices = deviceroot.findall('Device')
-        if devices is not None:
-            for dev in devices:
-                hostname = dev.attrib['Hostname']
-                if hostname is not None:
-                    deviceinfo[hostname] = {}
-                    hwsku = dev.attrib['HwSku']
-                    devtype = dev.attrib['Type']
-                    deviceinfo[hostname]['HwSku'] = hwsku
-                    deviceinfo[hostname]['Type'] = devtype
-                    self.links[hostname] = {}
-        devicel2info = {}
-        devicel3s = self.root.find(self.dpgtag).findall('DevicesL3Info')
-        devicel2s = self.root.find(self.dpgtag).findall('DevicesL2Info')
-        if devicel2s is not None:
-            for l2info in devicel2s:
-                hostname = l2info.attrib['Hostname']
-                if hostname is not None:
-                    devicel2info[hostname] = {}
-                    vlans = l2info.findall('InterfaceVlan')
-                    for vlan in vlans:
-                        portname = vlan.attrib['portname']
-                        portmode = vlan.attrib['mode']
-                        portvlanid = vlan.attrib['vlanids']
-                        portvlanlist = self.port_vlanlist(portvlanid)
-                        devicel2info[hostname][portname] = {'mode': portmode, 'vlanids': portvlanid, 'vlanlist': portvlanlist}
-        if devicel3s is not None:
-            for l3info in devicel3s:
-                hostname = l3info.attrib['Hostname']
-                if hostname is not None:
-                    management_ip = l3info.find('ManagementIPInterface').attrib['Prefix']
-                    deviceinfo[hostname]['ManagementIp'] = management_ip
-                    mgmtip = ipaddress.IPNetwork(management_ip)
-                    deviceinfo[hostname]['mgmtip'] = str(mgmtip.ip)
-                    management_gw = str(mgmtip.network+1)
-                    deviceinfo[hostname]['ManagementGw'] = management_gw
-        allinks = self.root.find(self.pngtag).find('DeviceInterfaceLinks').findall('DeviceInterfaceLink')
-        if allinks is not None:
-            for link in allinks:
-                start_dev = link.attrib['StartDevice']
-                end_dev = link.attrib['EndDevice']
-                if start_dev:
-                    self.links[start_dev][link.attrib['StartPort']] = {'peerdevice':link.attrib['EndDevice'], 'peerport': link.attrib['EndPort'], 'speed': link.attrib['BandWidth']}
-                if end_dev:
-                    self.links[end_dev][link.attrib['EndPort']] = {'peerdevice': link.attrib['StartDevice'], 'peerport': link.attrib['StartPort'], 'speed': link.attrib['BandWidth']}
-        self.devices = deviceinfo
-        self.vlanport = devicel2info
-
-    def convert_list2range(self, l):
-        """
-        common module to convert a  list to range for easier vlan configuration generation
-        """
-        ranges = []
-        sl = sorted(set(l))
-        for k,g in groupby(enumerate(sl), lambda (i,x): i-x):
-            group = list(map(itemgetter(1), g))
-            if len(group) == 1:
-                ranges.append(str(group[0]))
-            else:
-                ranges.append(str(group[0])+'-'+str(group[-1]))
-        return ranges
-
-    def get_server_links(self):
-        return self.server
-
-    def get_host_vlan(self, hostname):
-        """
-        Calculate dpg vlan data for each link(port) and return a Switch/Device total Vlan range
-        """
-
-        if hostname in self.devices and  self.devices[hostname]['Type'].lower() == 'devsonic':
-            self.vlanport[hostname] = {}
-            for port in self.links[hostname]:
-                peerdevice = self.links[hostname][port]['peerdevice']
-                peerport = self.links[hostname][port]['peerport']
-                peerportmode = self.vlanport[peerdevice][peerport]['mode']
-                peervlanids = self.vlanport[peerdevice][peerport]['vlanids']
-                peervlanlist = self.vlanport[peerdevice][peerport]['vlanlist']
-                self.vlanport[hostname][port] = {'mode': peerportmode, 'vlanids': peervlanids, 'vlanlist': peervlanlist}
-
-        if hostname in self.vlanport:
-            dpgvlans = self.vlanport[hostname]
-            vlans  = []
-            for intf in dpgvlans:
-                vlans += dpgvlans[intf]['vlanlist']
-            self.vlanrange = self.convert_list2range(vlans)
-            return {'VlanRange': self.vlanrange, 'VlanList': vlans }
-
-    def get_host_device_info(self, hostname):
-        """
-        return  the given hostname device info of hwsku and type
-        """
-        if hostname in self.devices:
-            return  self.devices[hostname]
+        if not part:
+            if set(hostnames) <= graph_hostnames:
+                target_graph = lab_graph
+                target_group = group
+                break
         else:
-            return self.devices
+            THRESHOLD = 0.8
+            in_graph_hostnames = set(hostnames).intersection(graph_hostnames)
+            if len(in_graph_hostnames) * 1.0 / len(hostnames) >= THRESHOLD:
+                target_graph = lab_graph
+                target_group = group
+                break
 
-    def get_host_port_vlans(self, hostname):
-        """
-        return the given hostname device  vlan port information
-        """
-        if hostname in self.vlanport:
-            return self.vlanport[hostname]
-        else:
-            return self.vlanport
+    if target_graph is not None:
+        logging.debug("Returning lab graph of group {} for hosts {}".format(target_group, hostnames))
 
-    def get_host_connections(self, hostname):
-        """
-        return the given hostname device each individual connection
-        """
-        if hostname in self.links:
-            return self.links[hostname]
-        else:
-            return self.links
+    return target_graph
+
 
 def main():
     module = AnsibleModule(
         argument_spec=dict(
             host=dict(required=False),
-            filename=dict(required=False),
+            hosts=dict(required=False, type='list'),
+            filepath=dict(required=False),
+            group=dict(required=False),
+            anchor=dict(required=False, type='list'),
+            ignore_errors=dict(required=False, type='bool', default=False),
+            forced_mgmt_routes=dict(required=False, type='list'),
         ),
+        mutually_exclusive=[['host', 'hosts', 'anchor']],
         supports_check_mode=True
     )
     m_args = module.params
-    hostname = m_args['host']
+    anchor = m_args['anchor']
+    if m_args['hosts']:
+        hostnames = m_args['hosts']
+    elif m_args['host']:
+        hostnames = [m_args['host']]
+    else:
+        # return the whole graph
+        hostnames = []
+
     try:
-        if m_args['filename']:
-            filename = m_args['filename']
+        # When called by pytest, the file path is obscured to /tmp/.../.
+        # we need the caller to tell us where the graph files are with
+        # filepath argument.
+        if m_args["filepath"]:
+            global LAB_GRAPHFILE_PATH
+            LAB_GRAPHFILE_PATH = m_args['filepath']
+
+        if m_args["group"]:
+            lab_graph = LabGraph(
+                LAB_GRAPHFILE_PATH,
+                m_args["group"],
+                forced_mgmt_routes=m_args.get("forced_mgmt_routes")
+            )
         else:
-            filename = LAB_GRAPHFILE_PATH + LAB_CONNECTION_GRAPH_FILE
-        lab_graph = Parse_Lab_Graph(filename)
-        lab_graph.parse_graph()
-        dev = lab_graph.get_host_device_info(hostname)
-        if dev is None:
-            module.fail_json(msg="cannot find info for "+hostname)
-        results = {}
-        results['device_info'] =  lab_graph.get_host_device_info(hostname)
-        results['device_conn'] = lab_graph.get_host_connections(hostname)
-        if lab_graph.get_host_vlan(hostname):
-            results['device_vlan_range'] = lab_graph.get_host_vlan(hostname)['VlanRange']
-            results['device_vlan_list'] = lab_graph.get_host_vlan(hostname)['VlanList']
-        results['device_port_vlans'] = lab_graph.get_host_port_vlans(hostname)
-        module.exit_json(ansible_facts=results)
+            # When calling passed in anchor instead of hostnames,
+            # the caller is asking to return the whole graph. This
+            # is needed when configuring the root fanout switch.
+            target = anchor if anchor else hostnames
+            lab_graph = find_graph(
+                target,
+                forced_mgmt_routes=m_args.get("forced_mgmt_routes")
+            )
+
+        if not lab_graph:
+            results = {
+                'device_info': {},
+                'device_conn': {},
+                'device_port_vlans': {},
+            }
+            module.exit_json(ansible_facts=results)
+
+        # early return for the whole graph
+        if not hostnames:
+            results = {
+                'device_info': lab_graph.graph_facts["devices"],
+                'device_conn': lab_graph.graph_facts["links"],
+                'device_port_vlans': lab_graph.graph_facts["port_vlans"]
+            }
+            module.exit_json(ansible_facts=results)
+        succeed, results = lab_graph.build_results(hostnames, m_args['ignore_errors'])
+        if succeed:
+            module.exit_json(ansible_facts=results)
+        else:
+            module.fail_json(msg=results)
     except (IOError, OSError):
-        module.fail_json(msg="Can not find lab graph file "+LAB_CONNECTION_GRAPH_FILE)
-    except Exception as e:
+        module.fail_json(msg="Can not find required file, exception: {}".format(traceback.format_exc()))
+    except Exception:
         module.fail_json(msg=traceback.format_exc())
 
 
-from ansible.module_utils.basic import *
-if __name__== "__main__":
+if __name__ == "__main__":
     main()
-
-

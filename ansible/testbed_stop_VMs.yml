@@ -1,6 +1,6 @@
 ---
 # This Playbook removes all VMs defined in an inventory file under vms_x
-# 
+#
 # We need to run this playbook before server restart to clean up everything.
 #
 # To stop all vm_sets on all servers:
@@ -11,6 +11,5 @@
 #
 
 - hosts: servers:&vm_host
-  gather_facts: no
   roles:
-  - { role: vm_set, action: 'stop' }
+  - { role: vm_set, vm_set_action: 'stop' }

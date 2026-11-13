@@ -1,9 +1,14 @@
 [
-{% if outer_ipv4 | bool %}
+{% if outer_ipv4 %}
         {
-                "TUNNEL_DECAP_TABLE:IPINIP_V4_TUNNEL" : {
+                "TUNNEL_DECAP_TERM_TABLE:TEST_IPINIP_V4_TUNNEL:{{ lo_ip }}" : {
+                    "term_type":"P2MP"
+                },
+                "OP": "{{ op }}"
+        },
+        {
+                "TUNNEL_DECAP_TABLE:TEST_IPINIP_V4_TUNNEL" : {
                         "tunnel_type":"IPINIP",
-                        "dst_ip":"{{ lo_ip }}",
                         "dscp_mode":"{{ dscp_mode }}",
                         "ecn_mode":"{{ ecn_mode }}",
                         "ttl_mode":"{{ ttl_mode }}"
@@ -11,13 +16,18 @@
                 "OP": "{{ op }}"
         }
 {% endif %}
-{% if outer_ipv6 | bool and outer_ipv4 | bool %} ,
+{% if outer_ipv6 and outer_ipv4 %} ,
 {% endif %}
-{% if outer_ipv6 | bool %}
+{% if outer_ipv6 %}
         {
-                "TUNNEL_DECAP_TABLE:IPINIP_V6_TUNNEL" : {
+                "TUNNEL_DECAP_TERM_TABLE:TEST_IPINIP_V6_TUNNEL:{{ lo_ipv6 }}" : {
+                    "term_type":"P2MP"
+                },
+                "OP": "{{ op }}"
+        },
+        {
+                "TUNNEL_DECAP_TABLE:TEST_IPINIP_V6_TUNNEL" : {
                         "tunnel_type":"IPINIP",
-                        "dst_ip":"{{ lo_ipv6 }}",
                         "dscp_mode":"{{ dscp_mode }}",
                         "ecn_mode":"{{ ecn_mode }}",
                         "ttl_mode":"{{ ttl_mode }}"

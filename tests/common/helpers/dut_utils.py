@@ -1,0 +1,1181 @@
+import logging
+import pathlib
+import allure
+import os
+import jinja2
+import glob
+import re
+import shlex
+import yaml
+import pytest
+from tests.common.helpers.assertions import pytest_assert
+from tests.common.utilities import get_host_visible_vars
+from tests.common.utilities import wait_until
+from tests.common.errors import RunAnsibleModuleFail
+from collections import defaultdict
+from tests.common.connections.console_host import ConsoleHost, CONSOLE_LINECARD
+from tests.common.connections.linecard_console_conn import UnsupportedPlatformError
+from tests.common.utilities import get_dut_current_passwd, update_console_creds
+from tests.common.connections.base_console_conn import (
+    CONSOLE_SSH_CISCO_CONFIG,
+    CONSOLE_SSH_DIGI_CONFIG,
+    CONSOLE_SSH_RARITAN_CONFIG,
+    CONSOLE_SSH_SONIC_CONFIG
+)
+import time
+from tests.common.mellanox_data import is_mellanox_device, is_issu_enabled
+import random
+
+CONTAINER_CHECK_INTERVAL_SECS = 1
+CONTAINER_RESTART_THRESHOLD_SECS = 180
+NAT_ENABLE_KEY = "nat_enabled_on_{}"
+# Spacing between console reconnect retries; keep >= getty StartLimitIntervalSec to avoid tripping its start limit.
+CONSOLE_RECONNECT_BACKOFF_SECS = 12
+
+# Ansible config files
+LAB_CONNECTION_GRAPH_PATH = pathlib.Path(
+    os.getenv("ANSIBLE_CONFIG", pathlib.Path(__file__).resolve().parent.joinpath("../../ansible"))).joinpath("files")
+
+BASI_PATH = os.path.dirname(os.path.abspath(__file__))
+
+
+logger = logging.getLogger(__name__)
+
+
+def select_proxy_env(creds, ipv6_only_mgmt):
+    """Select the proxy configuration matching the management network mode."""
+    if not ipv6_only_mgmt or "proxy_env_ipv6" not in creds:
+        return creds
+
+    proxy_env_ipv6 = creds["proxy_env_ipv6"]
+    if not isinstance(proxy_env_ipv6, dict):
+        raise ValueError("proxy_env_ipv6 must be a dictionary")
+
+    selected_creds = dict(creds)
+    selected_creds["proxy_env"] = dict(proxy_env_ipv6)
+    return selected_creds
+
+
+def is_supervisor_node(inv_files, hostname):
+    """Check if the current node is a supervisor node in case of multi-DUT.
+     @param inv_files: List of inventory file paths, In tests,
+            you can be get it from get_inventory_files in tests.common.utilities
+     @param hostname: hostname as defined in the inventory
+    Returns:
+          Currently, we are using 'card_type' in the inventory to make the decision.
+          If 'card_type' for the node is defined in the inventory, and it is 'supervisor',
+          then return True, else return False. In future, we can change this
+          logic if possible to derive it from the DUT.
+    """
+    dut_vars = get_host_visible_vars(inv_files, hostname)
+    if dut_vars and 'card_type' in dut_vars and dut_vars['card_type'] == 'supervisor':
+        return True
+    return False
+
+
+def is_frontend_node(inv_files, hostname):
+    """Check if the current node is a frontend node in case of multi-DUT.
+     @param inv_files: List of inventory file paths, In tests,
+            you can be get it from get_inventory_files in tests.common.utilities
+     @param hostname: hostname as defined in the inventory
+     Returns:
+          True if it is not any other type of node.
+          Currently, the only other type of node supported is 'supervisor' node.
+          If we add more types of nodes, then we need to exclude them from this method as well.
+    """
+    return not is_supervisor_node(inv_files, hostname)
+
+
+def is_macsec_capable_node(inv_files, hostname):
+    dut_vars = get_host_visible_vars(inv_files, hostname)
+    if dut_vars and 'macsec_card' in dut_vars and dut_vars['macsec_card']:
+        return True
+    return False
+
+
+def is_container_running(duthost, container_name):
+    """Decides whether the container is running or not
+    @param duthost: Host DUT.
+    @param container_name: Name of a container.
+    Returns:
+        Boolean value. True represents the container is running
+    """
+    running_containers = duthost.shell(r"docker ps -f 'status=running' --format \{\{.Names\}\}")['stdout_lines']
+    return container_name in running_containers
+
+
+def check_container_state(duthost, container_name, should_be_running):
+    """Determines whether a container is in the expected state (running/not running)
+    @param duthost: Host DUT.
+    @param container_name: Name of container.
+    @param should_be_running: Boolean value.
+    Returns:
+        This function will return True if the container was in the expected state.
+        Otherwise, it will return False.
+    """
+    is_running = is_container_running(duthost, container_name)
+    return is_running == should_be_running
+
+
+def wait_for_container_running(duthost, container_name, timeout=120, check_interval=5):
+    """Wait until `container_name` is in the running state on `duthost`.
+
+    Polls `is_container_running` every `check_interval` seconds, up to
+    `timeout` seconds total. Raises an Exception if the container is still
+    not running when the timeout expires.
+    """
+    logger.info("Waiting for container %s to be running on %s", container_name, duthost.hostname)
+    if not wait_until(timeout, check_interval, 0, is_container_running, duthost, container_name):
+        raise TimeoutError(
+            "Container {} is not running on {} after {} seconds".format(
+                container_name, duthost.hostname, timeout
+            )
+        )
+
+
+def is_hitting_start_limit(duthost, container_name):
+    """Checks whether the container can not be restarted is due to start-limit-hit.
+    @param duthost: Host DUT.
+    @param ontainer_name: name of a container.
+    Returns:
+        If start limitation was hit, then this function will return True. Otherwise
+        it returns False.
+    """
+    service_status = duthost.shell("sudo systemctl status {}.service | grep 'Active'".format(container_name))
+    for line in service_status["stdout_lines"]:
+        if "start-limit-hit" in line:
+            return True
+
+    return False
+
+
+def clear_failed_flag_and_restart(duthost, container_name):
+    """Clears the failed flag of a container and restart it.
+    @param duthost: Host DUT.
+    @param container_name: name of a container.
+    Returns:
+        None
+    """
+    logger.info("{} hits start limit and clear reset-failed flag".format(container_name))
+    duthost.shell("sudo systemctl reset-failed {}.service".format(container_name))
+    duthost.shell("sudo systemctl start {}.service".format(container_name))
+    restarted = wait_until(CONTAINER_RESTART_THRESHOLD_SECS,
+                           CONTAINER_CHECK_INTERVAL_SECS,
+                           0,
+                           check_container_state, duthost, container_name, True)
+    pytest_assert(restarted, "Failed to restart container '{}' after reset-failed was cleared".format(container_name))
+
+
+def restart_service_with_startlimit_guard(duthost, service_name, is_namespaced=False,
+                                          backoff_seconds=30, verify_timeout=180):
+    """
+    Restart a systemd-managed service with StartLimitHit guard.
+
+    Strategy:
+    0) Pre-detect StartLimitHit and, if present, skip a failing restart
+    1) When not rate-limited, reset-failed to clear stale counters and try restart
+    2) If restart fails, rate-limit is detected, or container isn't running:
+       - 'systemctl reset-failed <service>.service'
+       - fixed backoff (default 30s when rate-limited, 1s otherwise)
+       - 'systemctl start <service>.service'
+       - wait until container is running
+
+    Returns: True when the service is (re)started and running; asserts on failure.
+    """
+
+    if is_namespaced:
+        # just check first namespaced instance
+        container_name = "{}0".format(service_name)
+        service_name = "{}@0".format(service_name)
+    else:
+        container_name = service_name
+
+    # 0) Pre-detect StartLimitHit so we can optionally skip a failing restart
+    pre_rate_limited = is_hitting_start_limit(duthost, service_name)
+
+    if not pre_rate_limited:
+        # 1) Proactively clear stale failure counters and try a normal restart
+        duthost.shell(
+            f"sudo systemctl reset-failed {service_name}.service",
+            module_ignore_errors=True
+        )
+        ret = duthost.shell(
+            f"sudo systemctl restart {service_name}.service",
+            module_ignore_errors=True
+        )
+        rate_limited = is_hitting_start_limit(duthost, service_name)
+    else:
+        logger.info(
+            f"StartLimitHit pre-detected for {service_name}, applying reset-failed and "
+            f"fixed backoff {backoff_seconds}s before start"
+        )
+        # Force the recovery path below without attempting an immediate restart.
+        ret = {"rc": 1}
+        rate_limited = True
+
+    # 2/3) Recovery path: reset-failed + backoff + start if needed
+    if ret.get("rc", 1) != 0 or rate_limited or not is_container_running(duthost, container_name):
+        duthost.shell(
+            f"sudo systemctl reset-failed {service_name}.service",
+            module_ignore_errors=True
+        )
+        time.sleep(backoff_seconds if rate_limited else 1)
+        duthost.shell(
+            f"sudo systemctl start {service_name}.service",
+            module_ignore_errors=True
+        )
+        pytest_assert(
+            wait_until(verify_timeout, 1, 0, check_container_state, duthost, container_name, True),
+            f"{container_name} container did not become running after recovery start"
+        )
+
+    return True
+
+
+def get_group_program_info(duthost, container_name, group_name):
+    """Gets program names, running status and their pids by analyzing the command
+       output of "docker exec <container_name> supervisorctl status". Program name
+       at here represents a program which is part of group <group_name>
+
+    Args:
+        duthost: Hostname of DUT.
+        container_name: A string shows container name.
+        program_name: A string shows process name.
+
+    Returns:
+        A dictionary where keys are the program names and values are their running
+        status and pids.
+    """
+    group_program_info = defaultdict(list)
+    program_name = None
+    program_status = None
+    program_pid = None
+
+    program_list = duthost.shell("docker exec {} supervisorctl status"
+                                 .format(container_name), module_ignore_errors=True)
+    for program_info in program_list["stdout_lines"]:
+        if program_info.find(group_name) != -1:
+            program_name = program_info.split()[0].split(':')[1].strip()
+            program_status = program_info.split()[1].strip()
+            if program_status in ["EXITED", "STOPPED", "STARTING"]:
+                program_pid = -1
+            else:
+                program_pid = int(program_info.split()[3].strip(','))
+
+            group_program_info[program_name].append(program_status)
+            group_program_info[program_name].append(program_pid)
+
+            if program_pid != -1:
+                logger.info("Found program '{}' in the '{}' state with pid {}"
+                            .format(program_name, program_status, program_pid))
+
+    return group_program_info
+
+
+def get_container_processes(duthost, container_name, program_name):
+    """Return matching host PIDs and command lines from one container."""
+    result = duthost.shell("docker top {} -eo pid,args".format(container_name))
+    processes = []
+    for line in result["stdout_lines"][1:]:
+        pid, command = line.split(None, 1)
+        if os.path.basename(command.split()[0]) == program_name:
+            processes.append((int(pid), command))
+    return processes
+
+
+def kill_container_processes(duthost, processes):
+    """Kill exact host PIDs previously discovered through docker top."""
+    if processes:
+        pids = " ".join(str(pid) for pid, _ in processes)
+        duthost.shell("sudo kill -9 {} || true".format(pids))
+
+
+def start_container_process(duthost, container_name, command):
+    """Start one detached unmanaged process inside a container."""
+    duthost.shell(
+        "docker exec -d {} sh -c {}".format(
+            container_name,
+            shlex.quote(command),
+        )
+    )
+
+
+def get_program_info(
+    duthost, container_name, program_name, include_uptime=False
+):
+    """Gets program running status and its pid by analyzing the command
+       output of "docker exec <container_name> supervisorctl status"
+
+    Args:
+        duthost: Hostname of DUT.
+        container_name: A string shows container name.
+        program_name: A string shows process name.
+        include_uptime: When True, also return the uptime field supervisorctl
+            reports for a RUNNING program (e.g. "0:12:34", or "37 days,
+            17:55:12" past the first day). Defaults to False so existing
+            callers keep unpacking a 2-tuple unchanged.
+
+    Return:
+        Program running status and its pid. When include_uptime is True, a
+        third value (uptime string, or None if not RUNNING) is also returned.
+    """
+    program_status = None
+    program_pid = -1
+    program_uptime = None
+
+    program_list = duthost.shell("docker exec {} supervisorctl status"
+                                 .format(container_name), module_ignore_errors=True)
+    for program_info in program_list["stdout_lines"]:
+        if program_info.find(program_name) != -1:
+            fields = program_info.split()
+            program_status = fields[1].strip()
+            if program_status == "RUNNING":
+                program_pid = int(fields[3].strip(','))
+                if "uptime" in fields:
+                    program_uptime = " ".join(
+                        fields[fields.index("uptime") + 1:]
+                    )
+            break
+
+    if program_pid != -1:
+        logger.info("Found program '{}' in the '{}' state with pid {}"
+                    .format(program_name, program_status, program_pid))
+
+    if include_uptime:
+        return program_status, program_pid, program_uptime
+    return program_status, program_pid
+
+
+def kill_process_by_pid(duthost, container_name, program_name, program_pid):
+    """
+    @summary: Kill a process in the specified container by its pid
+    """
+    kill_cmd_result = duthost.shell("docker exec {} kill -SIGKILL {}".format(container_name, program_pid))
+
+    # Get the exit code of 'kill' command
+    exit_code = kill_cmd_result["rc"]
+    pytest_assert(exit_code == 0, "Failed to stop program '{}' before test".format(program_name))
+
+    logger.info("Program '{}' in container '{}' was stopped successfully"
+                .format(program_name, container_name))
+
+
+def get_disabled_container_list(duthost):
+    """Gets disabled container/service names and features without containers.
+
+    Args:
+        duthost: Host DUT.
+
+    Return:
+        Names to exclude from container checks.
+    """
+    # frr_bmp controls BMP inside bgp; it never owns a Docker container.
+    disabled_containers = ["frr_bmp"]
+
+    container_status, succeeded = duthost.get_feature_status()
+    pytest_assert(succeeded, "Failed to get status ('enabled'|'disabled') of containers. Exiting...")
+
+    for container_name, status in list(container_status.items()):
+        if "disabled" in status and container_name not in disabled_containers:
+            disabled_containers.append(container_name)
+    return disabled_containers
+
+
+def check_link_status(duthost, iface_list, expect_status):
+    """
+    check if the link status specified in the iface_list equal to expect status
+    :param duthost: dut host object
+    :param iface_list: the interface list
+    :param expect_status: expected status for the interface specified in the iface_list
+    :return: True if the status of all the interfaces specified in the iface_list equal to expect status, else False
+    """
+    int_status = duthost.show_interface(command="status")['ansible_facts']['int_status']
+    for intf in iface_list:
+        if int_status[intf]['admin_state'] == 'up' and int_status[intf]['oper_state'] != expect_status:
+            return False
+    return True
+
+
+def encode_dut_and_container_name(dut_name, container_name):
+    """Gets a string by combining dut name and container name.
+
+    Args:
+      dut_name: A string represents name of DuT.
+      container_name: A string represents name of container.
+
+    Returns:
+      A string includes the DuT and container names.
+    """
+
+    return dut_name + "|" + container_name
+
+
+def decode_dut_and_container_name(name_str):
+    """Gets DuT name and container name by parsing the string 'name_str'.
+
+    Args:
+      A string includes the DuT and container names.
+
+    Returns:
+      dut_name: A string represents name of DuT.
+      container_name: A string represents name of container.
+    """
+    dut_name = ""
+    container_name = ""
+
+    name_list = name_str.strip().split("|")
+    if len(name_list) >= 2:
+        dut_name = name_list[0]
+        container_name = name_list[1]
+    elif len(name_list) == 1:
+        container_name = name_list[0]
+
+    return dut_name, container_name
+
+
+def verify_features_state(duthost):
+    """Checks whether the state of each feature is valid.
+
+    Args:
+      duthost: An Ansible object of DuT.
+
+    Returns:
+      If states of all features are valid, returns True; otherwise,
+      returns False.
+    """
+    feature_status, succeeded = duthost.get_feature_status()
+    if not succeeded:
+        logger.info("Failed to get list of feature names.")
+        return False
+
+    for feature_name, status in list(feature_status.items()):
+        logger.info("The state of '{}' is '{}'.".format(feature_name, status))
+
+        if status not in ("enabled", "always_enabled", "disabled", "always_disabled"):
+            logger.info("The state of '{}' is invalid!".format(feature_name))
+            return False
+
+        logger.info("The state of '{}' is valid.".format(feature_name))
+
+    return True
+
+
+def verify_orchagent_running_or_assert(duthost):
+    """
+    Verifies that orchagent is running, asserts otherwise.
+    In case of multi-asic platforms verifies orchagent running for all the asic namespaces.
+
+    Args:
+        duthost: Device Under Test (DUT)
+    """
+
+    def _orchagent_running():
+        if duthost.is_multi_asic:
+            num_asic = duthost.facts.get('num_asic')
+            for asic_index in range(num_asic):
+                cmd = 'docker exec swss{} supervisorctl status orchagent'.format(asic_index)
+                output = duthost.shell(cmd, module_ignore_errors=True)
+                pytest_assert(not output['rc'], "Unable to check orchagent status output for asic_id {}"
+                              .format(asic_index))
+                if 'RUNNING' not in output['stdout']:
+                    return False
+            return True
+        else:
+            cmds = 'docker exec swss supervisorctl status orchagent'
+            output = duthost.shell(cmds, module_ignore_errors=True)
+            pytest_assert(not output['rc'], "Unable to check orchagent status output")
+            return 'RUNNING' in output['stdout']
+
+    pytest_assert(
+        wait_until(120, 10, 0, _orchagent_running),
+        "Orchagent is not running"
+    )
+
+
+def ignore_t2_syslog_msgs(duthost):
+
+    """
+        When we reboot / config_reload on T2 chassis cards, we see 2 error messages in the linecards
+
+        1) During config_reload/reboot of linecard, LAGS are deleted, but ports are up,
+        and we get mac learning events from SAI to orchagent
+        which is in middle of cleanup and doesn't have the right data.
+        This causes error message like Failed to get port by bridge port ID
+
+        2) reboot/config_reload on supoervisor  will cause all the fabric links in the linecard to
+        bounce which results in SAI sending messages orchagent regarding the fabric port state change.
+        However, in linecards in T2 chassis, there is modelling of fabric ports in orchagent. Thus, orchagent generates
+        error message indication to port object found for the port.
+        Please see https://github.com/sonic-net/sonic-buildimage/issues/9033 for details.
+    """
+    if duthost.topo_type == "t2" and duthost.facts.get('platform_asic') == "broadcom-dnx":
+        ignoreRegex = [".*orchagent.*Failed to get port by bridge port ID.*"]
+        if duthost.is_supervisor_node():
+            ignoreRegex.extend([".*orchagent.*Failed to get port object for port id.*"])
+        for a_dut in duthost.duthosts.frontend_nodes:
+            # DUT's loganalyzer would be null if we have disable_loganalyzer specified
+            if a_dut.loganalyzer:
+                a_dut.loganalyzer.ignore_regex.extend(ignoreRegex)
+
+
+def get_sai_sdk_dump_file(duthost, dump_file_name):
+    # a folder mounted from the host to the syncd container
+    # visible as /var/log/sdk_dbg for both the host and the syncd container
+    # and this won't cause syncd container memory usage to grow
+    dump_folder = "/var/log/sdk_dbg"
+    full_path_dump_file = f"{dump_folder}/{dump_file_name}"
+    logger.info(f"Generating SDK dump file: {full_path_dump_file}")
+    cmd_gen_sdk_dump = f"docker exec syncd bash -c 'saisdkdump -f {full_path_dump_file}' "
+    duthost.shell(cmd_gen_sdk_dump)
+
+    compressed_dump_file = f"/tmp/{dump_file_name}.tar.gz"
+    duthost.archive(path=full_path_dump_file, dest=compressed_dump_file, format='gz')
+
+    duthost.fetch(src=compressed_dump_file, dest="/tmp/", flat=True)
+    allure.attach.file(compressed_dump_file, dump_file_name, extension=".tar.gz")
+
+
+def is_mellanox_devices(hwsku):
+    """
+    A helper function to check if a given sku is Mellanox device
+    """
+    hwsku = hwsku.lower()
+    return 'mellanox' in hwsku \
+        or 'msn' in hwsku \
+        or 'mlnx' in hwsku
+
+
+def is_virtual_platform(duthost):
+    """Check if the DUT is running on a virtual (KVM) platform.
+
+    Args:
+        duthost: DUT host object.
+
+    Returns:
+        True if the platform is x86_64-kvm_x86_64-r0 (used by both VS and VPP testbeds),
+        False otherwise.
+    """
+    return duthost.facts.get("platform") == "x86_64-kvm_x86_64-r0"
+
+
+def is_mellanox_fanout(duthost, localhost):
+    # Ansible localhost fixture which calls ansible playbook on the local host
+
+    if is_virtual_platform(duthost):
+        return False
+
+    try:
+        dut_facts = \
+            localhost.conn_graph_facts(host=duthost.hostname, filepath=LAB_CONNECTION_GRAPH_PATH)["ansible_facts"]
+    except RunAnsibleModuleFail as e:
+        logger.info("Get dut_facts failed, reason:{}".format(e.results['msg']))
+        return False
+
+    intf = list(dut_facts["device_conn"][duthost.hostname].keys())[0]
+    fanout_host = dut_facts["device_conn"][duthost.hostname][intf]["peerdevice"]
+
+    try:
+        fanout_facts = \
+            localhost.conn_graph_facts(host=fanout_host, filepath=LAB_CONNECTION_GRAPH_PATH)["ansible_facts"]
+    except RunAnsibleModuleFail:
+        return False
+
+    fanout_sku = fanout_facts['device_info'][fanout_host]['HwSku']
+    if not is_mellanox_devices(fanout_sku):
+        return False
+
+    return True
+
+
+def get_dut_ports_with_checksum_modifying_fanouts(duthost, localhost):
+    """
+    Identifies and returns the set of DUT interface ports connected to fanout devices
+    that modify packet checksums. Some platforms, when used as a fanout, recalculate
+    and correct the checksum of transit packets, causing the DUT to receive packets
+    with a valid checksum instead of the intended invalid one.
+    """
+    checksum_modifying_fanout_skus = {"DellEMC-Z9332f-O32", "NH-5010-F-O64", "Arista-7280R4K-32QF-32DF-64O"}
+    unsupported_dut_ports = set()
+
+    # Virtual testbeds (VS and VPP/KVM) have no physical fanout to inspect; short-circuit
+    # to avoid unnecessary/failing connection-graph lookups (consistent with is_mellanox_fanout).
+    if is_virtual_platform(duthost):
+        return unsupported_dut_ports
+
+    try:
+        dut_facts = localhost.conn_graph_facts(host=duthost.hostname,
+                                               filepath=LAB_CONNECTION_GRAPH_PATH)["ansible_facts"]
+    except RunAnsibleModuleFail as e:
+        logger.info("Get dut_facts failed, reason: %s", e.results.get('msg', e))
+        return unsupported_dut_ports
+
+    try:
+        dev_conn = dut_facts["device_conn"][duthost.hostname]
+    except KeyError:
+        logger.info("device_conn missing for %s in connection graph", duthost.hostname)
+        return unsupported_dut_ports
+
+    device_info = dut_facts.get("device_info", {})
+    fanout_sku_cache = {}
+
+    for dut_port, conn_metadata in dev_conn.items():
+        fanout_host = conn_metadata.get("peerdevice")
+        if not fanout_host:
+            continue
+
+        if fanout_host in fanout_sku_cache:
+            fanout_sku = fanout_sku_cache[fanout_host]
+        else:
+            fanout_sku = device_info.get(fanout_host, {}).get("HwSku")
+            if fanout_sku is None:
+                try:
+                    fanout_facts = localhost.conn_graph_facts(
+                        host=fanout_host, filepath=LAB_CONNECTION_GRAPH_PATH)["ansible_facts"]
+                    fanout_sku = fanout_facts["device_info"][fanout_host]["HwSku"]
+                except (RunAnsibleModuleFail, KeyError):
+                    fanout_sku_cache[fanout_host] = None
+                    continue
+            fanout_sku_cache[fanout_host] = fanout_sku
+
+        if fanout_sku in checksum_modifying_fanout_skus:
+            unsupported_dut_ports.add(dut_port)
+
+    return unsupported_dut_ports
+
+
+def get_supervisor_for_linecard(duthost, duthosts, inv_files):
+    """
+    Returns the supervisor duthost for a given linecard duthost.
+
+    Args:
+        duthost: The potential linecard duthost
+        duthosts: Collection of all duthosts in the testbed
+        inv_files: Inventory files for looking up node types
+
+    Returns:
+        supervisor duthost object if this is a linecard with a supervisor, None otherwise
+
+    Conditions satisfied for returning supervisor:
+        - duthost is NOT a supervisor node
+        - A supervisor node exists in duthosts collection
+    """
+    if is_supervisor_node(inv_files, duthost.hostname):
+        return None
+
+    for node in duthosts.nodes:
+        node_hostname = node.hostname
+        if is_supervisor_node(inv_files, node_hostname):
+            return duthosts[node_hostname]
+
+    return None
+
+
+def create_linecard_console(supervisor, linecard_duthost, inv_files, creds):
+    """
+    Instantiates a CONSOLE_LINECARD connection for accessing a linecard via supervisor.
+
+    Args:
+        supervisor: The supervisor duthost object
+        linecard_duthost: The linecard duthost object
+        inv_files: Inventory files for looking up slot numbers
+        creds: Credentials dictionary
+
+    Returns:
+        ConsoleHost instance configured for linecard console access
+
+    Raises:
+        pytest.skip: If platform is not supported or slot_num not found
+    """
+    supervisor_ip = supervisor.host.options['inventory_manager'].get_host(
+        supervisor.hostname).vars['ansible_host']
+
+    host_vars = get_host_visible_vars(inv_files, linecard_duthost.hostname)
+    slot_num = host_vars.get('slot_num')
+
+    if not slot_num:
+        pytest.skip(f"Could not determine slot number for linecard {linecard_duthost.hostname} from inventory. "
+                    f"Ensure 'slot_num' variable is defined in inventory.")
+
+    try:
+        return ConsoleHost(
+            console_type=CONSOLE_LINECARD,
+            console_host=None,
+            console_port=None,
+            sonic_username=creds['sonicadmin_user'],
+            sonic_password=[creds['sonicadmin_password']],
+            supervisor_ip=supervisor_ip,
+            slot_num=slot_num,
+            hwsku=supervisor.facts['hwsku']
+        )
+    except UnsupportedPlatformError as e:
+        pytest.skip(f"Linecard console not supported: {str(e)}")
+
+
+def create_duthost_console(duthost, localhost, conn_graph_facts, creds, cancel_event=None):  # noqa: F811
+    dut_hostname = duthost.hostname
+    console_host = conn_graph_facts['device_console_info'][dut_hostname]['ManagementIp']
+    if "/" in console_host:
+        console_host = console_host.split("/")[0]
+    console_port = conn_graph_facts['device_console_link'][dut_hostname]['ConsolePort']['peerport']
+    console_type = conn_graph_facts['device_console_link'][dut_hostname]['ConsolePort']['type']
+    console_auth_type = conn_graph_facts['device_console_info'][dut_hostname].get('AuthType', "")
+    console_menu_type = conn_graph_facts['device_console_link'][dut_hostname]['ConsolePort']['menu_type']
+    console_username = conn_graph_facts['device_console_link'][dut_hostname]['ConsolePort']['proxy']
+    console_device = conn_graph_facts['device_console_link'][dut_hostname]['ConsolePort']['peerdevice']
+    console_direct_ssh_port = conn_graph_facts['device_console_link'][dut_hostname]['ConsolePort']['direct_ssh_port']
+
+    console_type = f"console_{console_type}"
+    update_console_creds(creds, console_auth_type)
+
+    if console_menu_type and console_menu_type.lower() != "n/a":
+        console_menu_type = f"{console_type}_{console_menu_type}"
+    else:
+        console_menu_type = console_type
+
+    # console password and sonic_password are lists, which may contain more than one password
+    # ansible-core >= 2.21: variable_manager._hostvars is None outside of a play run (it stays
+    # None in the pytest-ansible adhoc context). Fall back to the public get_vars() API, which
+    # resolves inventory + group + host vars for the target host.
+    _vm = localhost.host.options['variable_manager']
+    if _vm._hostvars is not None:
+        _host_vars = _vm._hostvars[dut_hostname]
+    else:
+        _host_obj = localhost.host.options['inventory_manager'].get_host(dut_hostname)
+        _host_vars = _vm.get_vars(host=_host_obj) if _host_obj is not None else {}
+    sonicadmin_alt_password = _host_vars.get("ansible_altpassword")
+    sonic_password = [creds['sonicadmin_password'], sonicadmin_alt_password]
+
+    if console_type in creds["console_password"]:
+        sonic_password.extend(creds["console_password"][console_type])
+
+    # Move the DUT's actual current password to the front so the console login succeeds on the first attempt.
+    try:
+        current_passwd = get_dut_current_passwd(
+            duthost.mgmt_ip,
+            duthost.mgmt_ipv6,
+            creds["sonicadmin_user"],
+            [p for p in sonic_password if p],
+        )
+        if current_passwd and current_passwd in sonic_password:
+            sonic_password.remove(current_passwd)
+        if current_passwd:
+            sonic_password.insert(0, current_passwd)
+    except Exception as e:
+        logger.warning(
+            f"Could not resolve current DUT console password, using default "
+            f"order: {e}")
+
+    # Attempt to clear the console port
+    try:
+        duthost_clear_console_port(
+            menu_type=console_menu_type,
+            console_host=console_host,
+            console_port=console_port,
+            console_username=console_username,
+            console_password=creds['console_password'][console_type],
+            enable_password=creds["console_enable_passwd"].get(console_type)
+        )
+    except Exception as e:
+        logger.warning(f"Issue trying to clear console port: {e}")
+
+    # Set up console host
+    for attempt in range(1, 4):
+        try:
+            return ConsoleHost(
+                console_type=console_type,
+                console_host=console_host,
+                console_port=console_port,
+                sonic_username=creds["sonicadmin_user"],
+                sonic_password=sonic_password,
+                console_username=console_username,
+                console_password=creds["console_password"][console_type],
+                console_device=console_device,
+                console_direct_ssh_port=console_direct_ssh_port,
+                cancel_event=cancel_event,
+            )
+        except Exception as e:
+            logger.warning(f"Attempt {attempt}/3 failed: {e}")
+            # Back off so rapid retries do not trip the DUT serial-getty start limit.
+            if attempt < 3:
+                time.sleep(CONSOLE_RECONNECT_BACKOFF_SECS)
+            continue
+    else:
+        raise Exception("Failed to set up connection to console port. See warning logs for details.")
+
+
+def creds_on_dut(duthost):
+    """ read credential information according to the dut inventory """
+    groups = duthost.host.options['inventory_manager'].get_host(duthost.hostname).get_vars()['group_names']
+    groups.append("fanout")
+    logger.info("dut {} belongs to groups {}".format(duthost.hostname, groups))
+    exclude_regex_patterns = [
+        r'topo_.*\.yml',
+        r'breakout_speed\.yml',
+        r'lag_fanout_ports_test_vars\.yml',
+        r'qos\.yml',
+        r'sku-sensors-data\.yml',
+        r'mux_simulator_http_port_map\.yml'
+        ]
+    ansible_folder_path = os.path.join(BASI_PATH, "../../../ansible/")
+    files = glob.glob(os.path.join(ansible_folder_path, "group_vars/all/*.yml"))
+    files += glob.glob(os.path.join(ansible_folder_path, "vars/*.yml"))
+    for group in groups:
+        files += glob.glob(os.path.join(ansible_folder_path, f"group_vars/{group}/*.yml"))
+    filtered_files = [
+        f for f in files if not re.search('|'.join(exclude_regex_patterns), f)
+    ]
+
+    creds = {}
+    for f in filtered_files:
+        with open(f) as stream:
+            v = yaml.safe_load(stream)
+            if v is not None:
+                creds.update(v)
+            else:
+                logging.info("skip empty var file {}".format(f))
+
+    cred_vars = [
+        "sonicadmin_user",
+        "sonicadmin_password",
+        "sonic_password",
+        "docker_registry_host",
+        "docker_registry_username",
+        "docker_registry_password",
+        "public_docker_registry_host"
+    ]
+    # ansible-core >= 2.21: variable_manager._hostvars is None outside of a play run (it stays
+    # None in the pytest-ansible adhoc context). Fall back to the public get_vars() API, which
+    # resolves inventory + group + host vars for the target host.
+    _vm = duthost.host.options['variable_manager']
+    if _vm._hostvars is not None:
+        hostvars = _vm._hostvars[duthost.hostname]
+    else:
+        _host_obj = duthost.host.options['inventory_manager'].get_host(duthost.hostname)
+        hostvars = _vm.get_vars(host=_host_obj) if _host_obj is not None else {}
+    for cred_var in cred_vars:
+        if cred_var in creds:
+            creds[cred_var] = jinja2.Template(creds[cred_var]).render(**hostvars)  # nosemgrep: direct-use-of-jinja2
+
+    creds["console_login_options"] = hostvars.get("console_login_options", {})
+
+    # load default creds for console
+    if "console_login" not in list(hostvars.keys()):
+        console_login_creds = {}
+    else:
+        console_login_creds = hostvars["console_login"]
+    creds["console_user"] = {}
+    creds["console_password"] = {}
+    creds["console_enable_passwd"] = {}
+
+    creds["ansible_altpasswords"] = []
+
+    # If ansible_altpasswords is empty, add ansible_altpassword to it
+    if len(creds["ansible_altpasswords"]) == 0:
+        creds["ansible_altpasswords"].append(hostvars["ansible_altpassword"])
+
+    passwords = creds["ansible_altpasswords"] + [creds["sonicadmin_password"]]
+    creds['sonicadmin_password'] = get_dut_current_passwd(
+        duthost.mgmt_ip,
+        duthost.mgmt_ipv6,
+        creds['sonicadmin_user'],
+        passwords
+    )
+
+    for k, v in list(console_login_creds.items()):
+        creds["console_user"][k] = v["user"]
+        creds["console_password"][k] = v["passwd"]
+        if "enable_passwd" in v:
+            creds["console_enable_passwd"][k] = v["enable_passwd"]
+
+    return creds
+
+
+def duthost_clear_console_port(
+        menu_type: str,
+        console_host: str,
+        console_port: str,
+        console_username: str,
+        console_password: str,
+        enable_password=None
+):
+    """
+    Helper function to clear the console port for a given DUT.
+    Useful when a device has an occupied console port, preventing dut_console tests from running.
+
+    Parameters:
+        menu_type: Connection type for the console's config menu (as expected by the ConsoleTypeMapper)
+        console_host: DUT host's console IP address
+        console_port: DUT host's console port, to be cleared
+        console_username: Username for the console account (overridden for Digi console)
+        console_password: Password for the console account
+        enable_password: Optional enable secret(s) for Cisco IOS console/terminal servers that
+            require privileged EXEC ('#') to run 'clear line'. Sourced from inventory
+            (console_login.<type>.enable_passwd in secrets.json). May be a single string or a
+            list of candidates, tried in order and capped at 3 attempts (Cisco IOS's own limit
+            on password tries per 'enable' invocation). If not configured, the 'enable' elevation
+            step is skipped and a warning is logged instead.
+    """
+    if menu_type == "console_ssh":
+        raise Exception("Device does not have a defined Console_menu_type.")
+
+    if menu_type == "console_conserver":
+        logger.info("Skip clearing conserver console port")
+        return
+
+    # Override console user if the configuration menu is Digi, as this requires admin login
+    console_user = 'admin' if menu_type == CONSOLE_SSH_DIGI_CONFIG else console_username
+
+    duthost_config_menu = ConsoleHost(
+        console_type=menu_type,
+        console_host=console_host,
+        console_port=console_port,
+        console_username=console_user,
+        console_password=console_password,
+        sonic_username=None,
+        sonic_password=None
+    )
+
+    # Wrap the clear-port sequence so duthost_config_menu always gets
+    # disconnected. A leftover open session here holds the physical console
+    # line and was found to make the subsequent real console connection
+    # fail with "Socket is closed" on every retry.
+    try:
+        # Cisco IOS rejects 'clear line' from user EXEC ('>'); it requires
+        # privileged EXEC ('#'). Elevate via 'enable' first, but only if not
+        # already at '#' (e.g. leftover privileged session) - sending the
+        # password blindly while already privileged would feed it to IOS as
+        # a bogus command.
+        if menu_type == CONSOLE_SSH_CISCO_CONFIG:
+            current_prompt = duthost_config_menu.find_prompt(pattern=r"(?:>|\#|\$)")
+            if not current_prompt.endswith('#'):
+                if not enable_password:
+                    logger.warning(
+                        "No enable_passwd configured for this console type (set "
+                        "console_login.<type>.enable_passwd in secrets.json to enable this); "
+                        "skipping 'enable' elevation. 'clear line' will likely fail from user EXEC."
+                    )
+                else:
+                    # Cisco IOS allows at most 3 password attempts per 'enable' invocation
+                    # before dropping back to user EXEC - cap candidates accordingly.
+                    candidate_passwords = (
+                        enable_password if isinstance(enable_password, list) else [enable_password]
+                    )[:3]
+
+                    # Read until either a password re-prompt or a prompt terminator after each
+                    # write, and branch on what came back. netmiko's read_until_pattern() drops
+                    # whatever it read if it times out waiting for a fixed pattern like r'#' -
+                    # reading a combined pattern instead avoids losing the "Password:" re-prompt
+                    # IOS sends on a wrong guess.
+                    pw_or_prompt = r"[Pp]assword:\s*$|[>#]\s*$"
+
+                    duthost_config_menu.write_channel('enable' + duthost_config_menu.RETURN)
+                    try:
+                        out = duthost_config_menu.read_until_pattern(pw_or_prompt)
+                    except Exception as e:
+                        logger.warning(f"No response detected after 'enable': {e}")
+                        out = ""
+
+                    for attempt_num, candidate in enumerate(candidate_passwords, start=1):
+                        if not re.search(r"[Pp]assword:\s*$", out):
+                            break
+                        duthost_config_menu.write_channel(candidate + duthost_config_menu.RETURN)
+                        try:
+                            out = duthost_config_menu.read_until_pattern(pw_or_prompt)
+                        except Exception as e:
+                            logger.warning(
+                                f"Enable password attempt {attempt_num}/{len(candidate_passwords)} "
+                                f"timed out waiting for a response: {e}"
+                            )
+                            out = ""
+                        logger.info(
+                            f"Enable elevation attempt {attempt_num}/{len(candidate_passwords)}: "
+                            + ("re-prompted for password" if re.search(r"[Pp]assword:\s*$", out)
+                               else "reached a prompt terminator")
+                        )
+
+                current_prompt = duthost_config_menu.find_prompt(pattern=r"(?:>|\#|\$)")
+                if not current_prompt.endswith('#'):
+                    raise Exception(
+                        "Failed to elevate to privileged EXEC ('#') via 'enable' "
+                        f"(still at prompt '{current_prompt}'); aborting console port clear "
+                        "to avoid sending further commands into a confused session state."
+                    )
+
+        # Command lists for each config menu type
+        # List of tuples, containing a command to execute, and an optional pattern to wait for
+        command_list = {
+            CONSOLE_SSH_DIGI_CONFIG: [
+                ('2', None),                                                    # Enter serial port config
+                (console_port, None),                                           # Choose DUT console port
+                ('a', None),                                                    # Enter port management
+                ('1', f'Port #{console_port} has been reset successfully.')     # Reset chosen port
+            ],
+            CONSOLE_SSH_SONIC_CONFIG: [
+                (f'sudo sonic-clear line {console_port}', None)     # Clear DUT console port (requires sudo)
+            ],
+            CONSOLE_SSH_CISCO_CONFIG: [
+                # Note: no 'tty' keyword - confirmed working syntax on this terminal
+                # server is 'clear line <n>', not 'clear line tty <n>'.
+                # Patterns are regexes - '[confirm]'/'[OK]' would match any single bracketed
+                # character (e.g. the echoed command's own 'c'), not the literal text, and
+                # read_until_prompt_or_pattern() also returns on base_prompt regardless - so a
+                # failed 'clear line' (e.g. invalid port) could otherwise still look like success.
+                (f'clear line {console_port}', r'\[confirm\]'),    # Clear DUT console port
+                ('', r'\[OK\]')                                     # Confirm selection
+            ],
+            CONSOLE_SSH_RARITAN_CONFIG: [
+                ('maintenance', "Maintenance"),
+                (f'logoff port {console_port}', 'Force log off successful.')
+            ],
+        }
+
+        for command, wait_for_pattern in command_list[menu_type]:
+            duthost_config_menu.write_channel(command + duthost_config_menu.RETURN)
+            output = duthost_config_menu.read_until_prompt_or_pattern(wait_for_pattern)
+            if menu_type == CONSOLE_SSH_CISCO_CONFIG and wait_for_pattern and not re.search(wait_for_pattern, output):
+                raise Exception(f"Unexpected response to '{command}': {output!r}")
+
+        logger.info(f"Successfully cleared console port {console_port}, sleeping for 5 seconds")
+    finally:
+        duthost_config_menu.disconnect()
+    time.sleep(5)
+
+
+def get_available_tech_support_files(duthost):
+    """
+    Get available techsupport files list
+    :param duthost: duthost object
+    :return: list of available techsupport files
+    """
+    try:
+        available_tech_support_files = duthost.shell('ls /var/dump/*.tar.gz')['stdout_lines']
+    except RunAnsibleModuleFail:
+        available_tech_support_files = []
+    return available_tech_support_files
+
+
+def get_new_techsupport_files_list(duthost, available_tech_support_files):
+    """
+    Get list of new created techsupport files
+    :param duthost: duthost object
+    :param available_tech_support_files: list of already available techsupport files
+    :return: list of new techsupport files
+    """
+    try:
+        duthost.shell('ls -lh /var/dump/')  # print into logs full folder content(for debug purpose)
+        new_available_tech_support_files = duthost.shell('ls /var/dump/*.tar.gz')['stdout_lines']
+    except RunAnsibleModuleFail:
+        new_available_tech_support_files = []
+    new_techsupport_files_list = list(set(new_available_tech_support_files) - set(available_tech_support_files))
+
+    return new_techsupport_files_list
+
+
+def extract_techsupport_tarball_file(duthost, tarball_name):
+    """
+    Extract techsupport tar file and return path to data extracted from archive
+    :param duthost: duthost object
+    :param tarball_name: path to tar file, example: /var/dump/sonic_dump_DUT_NAME_20210901_22140.tar.gz
+    :return: path to folder with techsupport data, example: /tmp/sonic_dump_DUT_NAME_20210901_22140
+    """
+    with allure.step('Extracting techsupport file: {}'.format(tarball_name)):
+        dst_folder = '/tmp/'
+        duthost.shell('tar -xf {} -C {}'.format(tarball_name, dst_folder))
+        techsupport_folder = tarball_name.split('.')[0].split('/var/dump/')[1]
+        techsupport_folder_full_path = '{}{}'.format(dst_folder, techsupport_folder)
+    return techsupport_folder_full_path
+
+
+def is_enabled_nat_for_dpu(duthost, request):
+    if request.config.cache.get(NAT_ENABLE_KEY.format(duthost.hostname), False):
+        logger.info("NAT is enabled")
+        return True
+    else:
+        logger.info('NAT is not enabled')
+        return False
+
+
+def get_dpu_names_and_ssh_ports(duthost, dpuhost_names, ansible_adhoc):
+    dpuhost_ssh_port_dict = {}
+    for dpuhost_name in dpuhost_names:
+        host = ansible_adhoc(become=True, args=[], kwargs={})[dpuhost_name]
+        vm = host.options["inventory_manager"].get_host(dpuhost_name).vars
+        ansible_ssh_port = vm.get("ansible_ssh_port", None)
+        if ansible_ssh_port:
+            dpuhost_ssh_port_dict[dpuhost_name] = ansible_ssh_port
+
+    duthost_name = duthost.hostname
+    dpu_name_ssh_port_dict = {}
+    for dpuhost_name, dpu_host_ssh_port in dpuhost_ssh_port_dict.items():
+        if duthost_name in dpuhost_name:
+            res = re.match(fr"{duthost_name}.*dpu.*(\d+)", dpuhost_name)
+            if res:
+                dpuhost_index = res[1]
+            else:
+                assert f"Not find the dpu name index in the {dpuhost_name}, please correct the dpuhost_name. " \
+                       f"dpuhost name should include the dut host name and the dpu index. " \
+                       f"e.g smartswitch-01-dpu-1, smartswitch-01 is the duthost name, " \
+                       f"dpu-1 is the dpu name, and 1 is the dpu index"
+            dpu_name_ssh_port_dict[f"dpu{dpuhost_index}"] = str(dpu_host_ssh_port)
+    logger.info(f"dpu_name_ssh_port_dict: {dpu_name_ssh_port_dict}")
+
+    return dpu_name_ssh_port_dict
+
+
+def check_nat_is_enabled_and_set_cache(duthost, request):
+    get_nat_iptable_output = 'sudo iptables -t nat -L'
+    nat_iptable_output = duthost.shell(get_nat_iptable_output)['stdout']
+    pattern_nat_result = '.*DNAT.*tcp.*anywhere.*anywhere.*tcp dpt:.* to:169.254.200.*22.*'
+    if re.search(pattern_nat_result, nat_iptable_output):
+        logger.info('NAT is enabled successfully')
+        request.config.cache.set(NAT_ENABLE_KEY.format(duthost.hostname), True)
+        return True
+    else:
+        raise Exception('NAT is not enabled successfully')
+
+
+def enable_nat_for_dpus(duthost, dpu_name_ssh_port_dict, request):
+    is_bookworm = "bookworm" in duthost.shell("cat /etc/os-release")['stdout']
+    sysctl_file = "/etc/sysctl.conf" if is_bookworm else "/usr/lib/sysctl.d/90-sonic.conf"
+    enable_nat_cmds = [
+        "sudo su",
+        f"sudo echo net.ipv4.ip_forward=1 >> {sysctl_file}",
+        f"sudo echo net.ipv4.conf.eth0.forwarding=1 >> {sysctl_file}",
+        f"sudo sysctl -p {sysctl_file}",
+        f"sudo sonic-dpu-mgmt-traffic.sh inbound -e --dpus "
+        f"{','.join(dpu_name_ssh_port_dict.keys())} --ports {','.join(dpu_name_ssh_port_dict.values())}",
+        "sudo iptables-save > /etc/iptables/rules.v4",
+        "exit"
+    ]
+    duthost.shell_cmds(cmds=enable_nat_cmds)
+    check_nat_is_enabled_and_set_cache(duthost, request)
+
+
+def get_random_reload_type(duthost):
+    """
+    Get a random reload type from the list of reload types
+    :param duthost: duthost object
+    :return: a random reload type
+    """
+    reload_types = ["reload", "cold", "fast", "warm"]
+    if duthost.is_bmc():
+        # BMC does not support fast reboot and warm reboot
+        logger.info("BMC does not support fast reboot and warm reboot, keep only reload and cold")
+        reload_types = ["reload", "cold"]
+    elif is_mellanox_device(duthost) and not is_issu_enabled(duthost):
+        logger.info("ISSU is not enabled on the Mellanox device, remove warm reboot from the list")
+        reload_types.remove("warm")
+    reboot_type = random.choice(reload_types)
+    logger.info(f"Selected reload type: {reboot_type}")
+    return reboot_type
+
+
+def migrate_container_systemd(duthost, service, parameters):
+    # Remove --net=host in parameters because it is already existed in /usr/bin/{service}.sh
+    parts = parameters.split()
+    no_network_parts = [p for p in parts if p != "--net=host"]
+    no_network_parameters = " ".join(no_network_parts)
+
+    duthost.shell(f'sed -i "s|docker create -t |docker create -t {no_network_parameters} |" /usr/bin/{service}.sh')
+    duthost.shell(f"systemctl reset-failed {service}", module_ignore_errors=True)
+    duthost.shell(f"systemctl restart {service}", module_ignore_errors=True)
